@@ -7,7 +7,7 @@ const Reply = union(enum) {
 
 const CounterMsg = union(enum) {
     inc: u64,
-    get: zart.Mailbox(Reply),
+    get: zart.ActorId(Reply),
     stop,
 };
 

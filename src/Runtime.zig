@@ -3,30 +3,30 @@ const Fiber = @import("Fiber.zig");
 
 const Allocator = std.mem.Allocator;
 
-pub const ActorId = struct {
+pub const AnyActorId = struct {
     index: usize,
     generation: u32,
 };
 
 pub const MessageTrace = struct {
-    from: ?ActorId,
-    to: ActorId,
+    from: ?AnyActorId,
+    to: AnyActorId,
 };
 
 pub const FailureTrace = struct {
-    actor: ActorId,
+    actor: AnyActorId,
     err: anyerror,
 };
 
 pub const TraceEvent = union(enum) {
-    actor_spawned: ActorId,
-    actor_resumed: ActorId,
-    actor_waiting: ActorId,
-    actor_yielded: ActorId,
-    actor_completed: ActorId,
+    actor_spawned: AnyActorId,
+    actor_resumed: AnyActorId,
+    actor_waiting: AnyActorId,
+    actor_yielded: AnyActorId,
+    actor_completed: AnyActorId,
     actor_failed: FailureTrace,
     message_sent: MessageTrace,
-    message_received: ActorId,
+    message_received: AnyActorId,
 };
 
 pub const Tracer = struct {
@@ -48,7 +48,7 @@ const ActorState = enum {
 
 const ActorHeader = struct {
     runtime: *Runtime,
-    id: ActorId,
+    id: AnyActorId,
     msg_type: usize,
     state: ActorState,
     queued: bool,
@@ -97,7 +97,7 @@ pub const Runtime = struct {
         rt.* = undefined;
     }
 
-    pub fn spawn(rt: *Runtime, actor: anytype) !Mailbox(MessageOf(@TypeOf(actor))) {
+    pub fn spawn(rt: *Runtime, actor: anytype) !ActorId(MessageOf(@TypeOf(actor))) {
         const Actor = @TypeOf(actor);
         const Msg = MessageOf(Actor);
 
@@ -108,7 +108,7 @@ pub const Runtime = struct {
         };
     }
 
-    pub fn send(rt: *Runtime, comptime Msg: type, actor_id: ActorId, msg: Msg) !void {
+    pub fn send(rt: *Runtime, comptime Msg: type, actor_id: AnyActorId, msg: Msg) !void {
         const actor = try rt.resolve(Msg, actor_id);
         rt.traceMessageSent(actor.id);
         try actor.send_fn(actor, &msg);
@@ -154,17 +154,17 @@ pub const Runtime = struct {
         }
     }
 
-    fn spawnFunction(rt: *Runtime, comptime Msg: type, comptime entry: anytype) !Mailbox(Msg) {
+    fn spawnFunction(rt: *Runtime, comptime Msg: type, comptime entry: anytype) !ActorId(Msg) {
         const Cell = FunctionActorCell(Msg, entry);
         return rt.spawnCell(Msg, Cell, {});
     }
 
-    fn spawnStruct(rt: *Runtime, comptime Msg: type, comptime Actor: type, actor: Actor) !Mailbox(Msg) {
+    fn spawnStruct(rt: *Runtime, comptime Msg: type, comptime Actor: type, actor: Actor) !ActorId(Msg) {
         const Cell = StructActorCell(Msg, Actor);
         return rt.spawnCell(Msg, Cell, actor);
     }
 
-    fn spawnCell(rt: *Runtime, comptime Msg: type, comptime Cell: type, actor_value: anytype) !Mailbox(Msg) {
+    fn spawnCell(rt: *Runtime, comptime Msg: type, comptime Cell: type, actor_value: anytype) !ActorId(Msg) {
         const cell = try rt.internal_allocator.create(Cell);
         errdefer rt.internal_allocator.destroy(cell);
 
@@ -175,7 +175,7 @@ pub const Runtime = struct {
         );
         errdefer rt.internal_allocator.free(stack);
 
-        const actor_id: ActorId = .{
+        const actor_id: AnyActorId = .{
             .index = rt.actors.items.len,
             .generation = 1,
         };
@@ -189,16 +189,16 @@ pub const Runtime = struct {
         rt.enqueue(&cell.header);
 
         return .{
-            .actor_id = actor_id,
+            .raw = actor_id,
             .runtime = rt,
         };
     }
 
-    fn resolve(rt: *Runtime, comptime Msg: type, actor_id: ActorId) !*ActorHeader {
-        if (actor_id.index >= rt.actors.items.len) return error.InvalidMailbox;
+    fn resolve(rt: *Runtime, comptime Msg: type, actor_id: AnyActorId) !*ActorHeader {
+        if (actor_id.index >= rt.actors.items.len) return error.InvalidActor;
 
-        const actor = rt.actors.items[actor_id.index] orelse return error.InvalidMailbox;
-        if (actor.id.generation != actor_id.generation) return error.InvalidMailbox;
+        const actor = rt.actors.items[actor_id.index] orelse return error.InvalidActor;
+        if (actor.id.generation != actor_id.generation) return error.InvalidActor;
         if (actor.msg_type != typeId(Msg)) return error.WrongMessageType;
 
         return switch (actor.state) {
@@ -245,33 +245,33 @@ pub const Runtime = struct {
         return @max(rt.options.execution_budget, 1);
     }
 
-    fn traceActorSpawned(rt: *Runtime, actor_id: ActorId) void {
+    fn traceActorSpawned(rt: *Runtime, actor_id: AnyActorId) void {
         if (rt.options.tracer) |tracer| tracer.record(.{ .actor_spawned = actor_id });
     }
 
-    fn traceActorResumed(rt: *Runtime, actor_id: ActorId) void {
+    fn traceActorResumed(rt: *Runtime, actor_id: AnyActorId) void {
         if (rt.options.tracer) |tracer| tracer.record(.{ .actor_resumed = actor_id });
     }
 
-    fn traceActorWaiting(rt: *Runtime, actor_id: ActorId) void {
+    fn traceActorWaiting(rt: *Runtime, actor_id: AnyActorId) void {
         if (rt.options.tracer) |tracer| tracer.record(.{ .actor_waiting = actor_id });
     }
 
-    fn traceActorYielded(rt: *Runtime, actor_id: ActorId) void {
+    fn traceActorYielded(rt: *Runtime, actor_id: AnyActorId) void {
         if (rt.options.tracer) |tracer| tracer.record(.{ .actor_yielded = actor_id });
     }
 
-    fn traceActorCompleted(rt: *Runtime, actor_id: ActorId) void {
+    fn traceActorCompleted(rt: *Runtime, actor_id: AnyActorId) void {
         if (rt.options.tracer) |tracer| tracer.record(.{ .actor_completed = actor_id });
     }
 
-    fn traceActorFailed(rt: *Runtime, actor_id: ActorId, err: anyerror) void {
+    fn traceActorFailed(rt: *Runtime, actor_id: AnyActorId, err: anyerror) void {
         if (rt.options.tracer) |tracer| {
             tracer.record(.{ .actor_failed = .{ .actor = actor_id, .err = err } });
         }
     }
 
-    fn traceMessageSent(rt: *Runtime, to: ActorId) void {
+    fn traceMessageSent(rt: *Runtime, to: AnyActorId) void {
         if (rt.options.tracer) |tracer| {
             tracer.record(.{
                 .message_sent = .{
@@ -282,20 +282,24 @@ pub const Runtime = struct {
         }
     }
 
-    fn traceMessageReceived(rt: *Runtime, actor_id: ActorId) void {
+    fn traceMessageReceived(rt: *Runtime, actor_id: AnyActorId) void {
         if (rt.options.tracer) |tracer| tracer.record(.{ .message_received = actor_id });
     }
 };
 
-pub fn Mailbox(comptime Msg: type) type {
+pub fn ActorId(comptime Msg: type) type {
     return struct {
         pub const Message = Msg;
 
-        actor_id: ActorId,
+        raw: AnyActorId,
         runtime: *Runtime,
 
-        pub fn send(mailbox: @This(), msg: Msg) !void {
-            try mailbox.runtime.send(Msg, mailbox.actor_id, msg);
+        pub fn send(actor_id: @This(), msg: Msg) !void {
+            try actor_id.runtime.send(Msg, actor_id.raw, msg);
+        }
+
+        pub fn any(actor_id: @This()) AnyActorId {
+            return actor_id.raw;
         }
     };
 }
@@ -307,7 +311,7 @@ pub fn Ctx(comptime Msg: type) type {
         runtime: *Runtime,
         actor: *ActorHeader,
         inbox: *Inbox(Msg),
-        self_mailbox: Mailbox(Msg),
+        self_actor: ActorId(Msg),
 
         pub fn recv(ctx: *@This()) !Msg {
             while (true) {
@@ -335,12 +339,12 @@ pub fn Ctx(comptime Msg: type) type {
             Fiber.yield();
         }
 
-        pub fn spawn(ctx: *@This(), actor: anytype) !Mailbox(MessageOf(@TypeOf(actor))) {
+        pub fn spawn(ctx: *@This(), actor: anytype) !ActorId(MessageOf(@TypeOf(actor))) {
             return ctx.runtime.spawn(actor);
         }
 
-        pub fn self(ctx: *const @This()) Mailbox(Msg) {
-            return ctx.self_mailbox;
+        pub fn self(ctx: *const @This()) ActorId(Msg) {
+            return ctx.self_actor;
         }
 
         pub fn allocator(ctx: *const @This()) Allocator {
@@ -393,7 +397,7 @@ fn FunctionActorCell(comptime Msg: type, comptime entry: anytype) type {
 
         const Self = @This();
 
-        fn init(rt: *Runtime, actor_id: ActorId, stack: []align(Fiber.stack_alignment) u8, _: void) Self {
+        fn init(rt: *Runtime, actor_id: AnyActorId, stack: []align(Fiber.stack_alignment) u8, _: void) Self {
             return .{
                 .header = .{
                     .runtime = rt,
@@ -418,8 +422,8 @@ fn FunctionActorCell(comptime Msg: type, comptime entry: anytype) type {
                 .runtime = cell.header.runtime,
                 .actor = &cell.header,
                 .inbox = &cell.inbox,
-                .self_mailbox = .{
-                    .actor_id = cell.header.id,
+                .self_actor = .{
+                    .raw = cell.header.id,
                     .runtime = cell.header.runtime,
                 },
             };
@@ -450,7 +454,7 @@ fn StructActorCell(comptime Msg: type, comptime Actor: type) type {
 
         const Self = @This();
 
-        fn init(rt: *Runtime, actor_id: ActorId, stack: []align(Fiber.stack_alignment) u8, actor: Actor) Self {
+        fn init(rt: *Runtime, actor_id: AnyActorId, stack: []align(Fiber.stack_alignment) u8, actor: Actor) Self {
             return .{
                 .header = .{
                     .runtime = rt,
@@ -476,8 +480,8 @@ fn StructActorCell(comptime Msg: type, comptime Actor: type) type {
                 .runtime = cell.header.runtime,
                 .actor = &cell.header,
                 .inbox = &cell.inbox,
-                .self_mailbox = .{
-                    .actor_id = cell.header.id,
+                .self_actor = .{
+                    .raw = cell.header.id,
                     .runtime = cell.header.runtime,
                 },
             };
@@ -572,7 +576,7 @@ test "function actor counter" {
 
     const CounterMsg = union(enum) {
         inc: u64,
-        get: Mailbox(Reply),
+        get: ActorId(Reply),
         stop,
     };
 
@@ -628,7 +632,7 @@ test "struct actor counter" {
 
     const CounterMsg = union(enum) {
         inc: u64,
-        get: Mailbox(Reply),
+        get: ActorId(Reply),
         stop,
     };
 
@@ -702,7 +706,7 @@ test "yield lets another runnable actor run" {
     };
 
     const WorkerMsg = union(enum) {
-        start: Mailbox(OtherMsg),
+        start: ActorId(OtherMsg),
     };
 
     const Actors = struct {
@@ -773,7 +777,7 @@ test "execution budget controls yield switching" {
     };
 
     const WorkerMsg = union(enum) {
-        start: Mailbox(OtherMsg),
+        start: ActorId(OtherMsg),
     };
 
     const Actors = struct {
@@ -830,11 +834,11 @@ test "actor can spawn child actor" {
     };
 
     const ChildMsg = union(enum) {
-        report: Mailbox(Reply),
+        report: ActorId(Reply),
     };
 
     const ParentMsg = union(enum) {
-        start: Mailbox(Reply),
+        start: ActorId(Reply),
     };
 
     const Actors = struct {
@@ -926,37 +930,37 @@ test "tracer records runtime events" {
     var rt = Runtime.init(testing.allocator, .{ .tracer = recorder.tracer() });
     defer rt.deinit();
 
-    const mailbox = try rt.spawn(Actor{});
-    try mailbox.send(.stop);
+    const actor = try rt.spawn(Actor{});
+    try actor.send(.stop);
     try rt.run();
 
     try testing.expectEqual(@as(usize, 5), recorder.len);
 
     switch (recorder.events[0]) {
-        .actor_spawned => |actor_id| try testing.expectEqual(mailbox.actor_id, actor_id),
+        .actor_spawned => |actor_id| try testing.expectEqual(actor.any(), actor_id),
         else => return error.UnexpectedTraceEvent,
     }
 
     switch (recorder.events[1]) {
         .message_sent => |message| {
-            try testing.expectEqual(@as(?ActorId, null), message.from);
-            try testing.expectEqual(mailbox.actor_id, message.to);
+            try testing.expectEqual(@as(?AnyActorId, null), message.from);
+            try testing.expectEqual(actor.any(), message.to);
         },
         else => return error.UnexpectedTraceEvent,
     }
 
     switch (recorder.events[2]) {
-        .actor_resumed => |actor_id| try testing.expectEqual(mailbox.actor_id, actor_id),
+        .actor_resumed => |actor_id| try testing.expectEqual(actor.any(), actor_id),
         else => return error.UnexpectedTraceEvent,
     }
 
     switch (recorder.events[3]) {
-        .message_received => |actor_id| try testing.expectEqual(mailbox.actor_id, actor_id),
+        .message_received => |actor_id| try testing.expectEqual(actor.any(), actor_id),
         else => return error.UnexpectedTraceEvent,
     }
 
     switch (recorder.events[4]) {
-        .actor_completed => |actor_id| try testing.expectEqual(mailbox.actor_id, actor_id),
+        .actor_completed => |actor_id| try testing.expectEqual(actor.any(), actor_id),
         else => return error.UnexpectedTraceEvent,
     }
 }
