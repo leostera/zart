@@ -334,6 +334,176 @@ test "actor can spawn child actor" {
     try testing.expectEqual(@as(u64, 42), observed);
 }
 
+test "ctx io preserves std Io signature and delegates to runtime io" {
+    const testing = std.testing;
+
+    const FakeIo = struct {
+        random_calls: usize = 0,
+        byte: u8 = 0xa5,
+
+        const Self = @This();
+
+        const vtable: std.Io.VTable = blk: {
+            var table = std.Io.failing.vtable.*;
+            table.random = random;
+            break :blk table;
+        };
+
+        fn interface(self: *Self) std.Io {
+            return .{
+                .userdata = self,
+                .vtable = &vtable,
+            };
+        }
+
+        fn random(context: ?*anyopaque, buffer: []u8) void {
+            const self: *Self = @ptrCast(@alignCast(context.?));
+            @memset(buffer, self.byte);
+            self.random_calls += 1;
+        }
+    };
+
+    const WorkerMsg = union(enum) {
+        run,
+    };
+
+    const Actors = struct {
+        fn readOne(io: std.Io, out: *u8) void {
+            var buffer: [1]u8 = undefined;
+            std.Io.random(io, &buffer);
+            out.* = buffer[0];
+        }
+
+        const Worker = struct {
+            pub const Msg = WorkerMsg;
+
+            out: *u8,
+
+            pub fn run(self: *@This(), ctx: *Ctx(WorkerMsg)) !void {
+                switch (try ctx.recv()) {
+                    .run => readOne(ctx.io(), self.out),
+                }
+            }
+        };
+    };
+
+    var fake_io: FakeIo = .{};
+    var rt = Runtime.init(testing.allocator, .{ .io = fake_io.interface() });
+    defer rt.deinit();
+
+    var observed: u8 = 0;
+    const worker = try rt.spawn(Actors.Worker{ .out = &observed });
+
+    try worker.send(.run);
+    try rt.run();
+
+    try testing.expectEqual(@as(u8, 0xa5), observed);
+    try testing.expectEqual(@as(usize, 1), fake_io.random_calls);
+}
+
+test "std Io calls consume io budget and yield cooperatively" {
+    const testing = std.testing;
+
+    const FakeIo = struct {
+        random_calls: usize = 0,
+
+        const Self = @This();
+
+        const vtable: std.Io.VTable = blk: {
+            var table = std.Io.failing.vtable.*;
+            table.random = random;
+            break :blk table;
+        };
+
+        fn interface(self: *Self) std.Io {
+            return .{
+                .userdata = self,
+                .vtable = &vtable,
+            };
+        }
+
+        fn random(context: ?*anyopaque, buffer: []u8) void {
+            const self: *Self = @ptrCast(@alignCast(context.?));
+            @memset(buffer, @as(u8, @intCast(self.random_calls)));
+            self.random_calls += 1;
+        }
+    };
+
+    const Trace = struct {
+        items: [8]u8 = undefined,
+        len: usize = 0,
+
+        fn push(self: *@This(), item: u8) void {
+            self.items[self.len] = item;
+            self.len += 1;
+        }
+
+        fn slice(self: *const @This()) []const u8 {
+            return self.items[0..self.len];
+        }
+    };
+
+    const WorkerMsg = union(enum) {
+        start,
+    };
+
+    const OtherMsg = union(enum) {
+        hit,
+    };
+
+    const Actors = struct {
+        const Worker = struct {
+            pub const Msg = WorkerMsg;
+
+            trace: *Trace,
+
+            pub fn run(self: *@This(), ctx: *Ctx(Msg)) !void {
+                switch (try ctx.recv()) {
+                    .start => {
+                        var buffer: [1]u8 = undefined;
+
+                        self.trace.push('a');
+                        std.Io.random(ctx.io(), &buffer);
+                        self.trace.push('b');
+                        std.Io.random(ctx.io(), &buffer);
+                        self.trace.push('c');
+                    },
+                }
+            }
+        };
+
+        const Other = struct {
+            pub const Msg = OtherMsg;
+
+            trace: *Trace,
+
+            pub fn run(self: *@This(), ctx: *Ctx(Msg)) !void {
+                switch (try ctx.recv()) {
+                    .hit => self.trace.push('x'),
+                }
+            }
+        };
+    };
+
+    var fake_io: FakeIo = .{};
+    var rt = Runtime.init(testing.allocator, .{
+        .io = fake_io.interface(),
+        .io_budget = 1,
+    });
+    defer rt.deinit();
+
+    var trace: Trace = .{};
+    const worker = try rt.spawn(Actors.Worker{ .trace = &trace });
+    const other = try rt.spawn(Actors.Other{ .trace = &trace });
+
+    try worker.send(.start);
+    try other.send(.hit);
+    try rt.run();
+
+    try testing.expectEqualStrings("axbc", trace.slice());
+    try testing.expectEqual(@as(usize, 2), fake_io.random_calls);
+}
+
 test "run parks waiting actors until later sends wake them" {
     const testing = std.testing;
 

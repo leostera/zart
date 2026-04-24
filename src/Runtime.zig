@@ -2,6 +2,7 @@ const std = @import("std");
 const Fiber = @import("Fiber.zig");
 const actor = @import("runtime/actor.zig");
 const inbox = @import("runtime/inbox.zig");
+const io = @import("runtime/io.zig");
 const registry = @import("runtime/registry.zig");
 const trace = @import("runtime/trace.zig");
 
@@ -13,7 +14,10 @@ pub const FailureTrace = trace.FailureTrace;
 pub const TraceEvent = trace.TraceEvent;
 pub const Tracer = trace.Tracer;
 pub const MessageOf = actor.MessageOf;
+pub const Io = std.Io;
 
+const ActorIoContext = io.ActorIoContext;
+const RuntimeIo = io.RuntimeIo;
 const Registry = registry.Registry(ActorHeader);
 
 const ActorState = enum {
@@ -24,13 +28,20 @@ const ActorState = enum {
     failed,
 };
 
+const WaitReason = union(enum) {
+    none,
+    recv,
+};
+
 const ActorHeader = struct {
     runtime: *Runtime,
     id: ActorId,
     msg_type: usize,
     state: ActorState,
+    wait_reason: WaitReason,
     queued: bool,
     budget_remaining: usize,
+    io_budget_remaining: usize,
     next_run: ?*ActorHeader,
     fiber: Fiber,
     stack: []align(Fiber.stack_alignment) u8,
@@ -53,15 +64,20 @@ pub const Runtime = struct {
         stack_size: usize = 64 * 1024,
         /// Number of explicit yield checkpoints an actor may pass per scheduler turn.
         execution_budget: usize = 64,
+        /// Number of completed I/O boundaries an actor may pass per scheduler turn.
+        io_budget: usize = 64,
         /// Allocator used for actor cells, fiber stacks, registry slots, and inbox nodes.
         internal_allocator: ?Allocator = null,
         /// Optional runtime event sink. `null` avoids constructing trace events.
         tracer: ?Tracer = null,
+        /// Optional standard I/O interface wrapped by `ctx.io()`.
+        io: ?std.Io = null,
     };
 
     allocator: Allocator,
     internal_allocator: Allocator,
     options: Options,
+    io: RuntimeIo,
     actors: Registry,
     run_head: ?*ActorHeader,
     run_tail: ?*ActorHeader,
@@ -69,10 +85,12 @@ pub const Runtime = struct {
 
     /// Creates a runtime. `allocator` is exposed to actors through `ctx.allocator()`.
     pub fn init(allocator: Allocator, options: Options) Runtime {
+        const internal_allocator = options.internal_allocator orelse std.heap.smp_allocator;
         return .{
             .allocator = allocator,
-            .internal_allocator = options.internal_allocator orelse std.heap.smp_allocator,
+            .internal_allocator = internal_allocator,
             .options = options,
+            .io = .init(options.io),
             .actors = .{},
             .run_head = null,
             .run_tail = null,
@@ -83,6 +101,7 @@ pub const Runtime = struct {
     /// Destroys all live actors and runtime-owned internal storage.
     pub fn deinit(rt: *Runtime) void {
         rt.actors.deinit(rt.internal_allocator, rt);
+        rt.io.deinit();
         rt.* = undefined;
     }
 
@@ -115,7 +134,9 @@ pub const Runtime = struct {
             if (ready.state != .runnable) continue;
 
             ready.state = .running;
+            ready.wait_reason = .none;
             ready.budget_remaining = rt.executionBudget();
+            ready.io_budget_remaining = rt.ioBudget();
             rt.traceActorResumed(ready.id);
             rt.current_actor = ready;
             const status = ready.fiber.run() catch |err| {
@@ -203,8 +224,14 @@ pub const Runtime = struct {
     fn wake(rt: *Runtime, target: *ActorHeader) void {
         switch (target.state) {
             .waiting => {
-                target.state = .runnable;
-                rt.enqueue(target);
+                switch (target.wait_reason) {
+                    .recv => {
+                        target.wait_reason = .none;
+                        target.state = .runnable;
+                        rt.enqueue(target);
+                    },
+                    .none => {},
+                }
             },
             .runnable, .running => {},
             .completed, .failed => {},
@@ -240,6 +267,24 @@ pub const Runtime = struct {
 
     fn executionBudget(rt: *const Runtime) usize {
         return @max(rt.options.execution_budget, 1);
+    }
+
+    fn ioBudget(rt: *const Runtime) usize {
+        return @max(rt.options.io_budget, 1);
+    }
+
+    fn chargeIoBoundary(rt: *Runtime, target: *ActorHeader) void {
+        if (target.io_budget_remaining > 1) {
+            target.io_budget_remaining -= 1;
+            return;
+        }
+
+        target.io_budget_remaining = 0;
+        target.wait_reason = .none;
+        target.state = .runnable;
+        rt.traceActorYielded(target.id);
+        rt.enqueue(target);
+        Fiber.yield();
     }
 
     fn traceActorSpawned(rt: *Runtime, actor_id: ActorId) void {
@@ -284,6 +329,12 @@ pub const Runtime = struct {
     }
 };
 
+fn chargeActorIo(runtime: *anyopaque, actor_header: *anyopaque) void {
+    const rt: *Runtime = @ptrCast(@alignCast(runtime));
+    const target: *ActorHeader = @ptrCast(@alignCast(actor_header));
+    rt.chargeIoBoundary(target);
+}
+
 /// Typed actor handle. This is the user-facing capability used for sends.
 pub fn Actor(comptime Msg: type) type {
     return actor.Actor(Runtime, ActorId, Msg);
@@ -298,6 +349,7 @@ pub fn Ctx(comptime Msg: type) type {
         actor: *ActorHeader,
         inbox: *Inbox(Msg),
         self_actor: Actor(Msg),
+        io_context: ActorIoContext,
 
         /// Receives the next message, yielding until one is available.
         pub fn recv(ctx: *@This()) !Msg {
@@ -309,6 +361,7 @@ pub fn Ctx(comptime Msg: type) type {
 
                 ctx.runtime.traceActorWaiting(ctx.actor.id);
                 ctx.actor.state = .waiting;
+                ctx.actor.wait_reason = .recv;
                 Fiber.yield();
             }
         }
@@ -325,9 +378,15 @@ pub fn Ctx(comptime Msg: type) type {
 
             ctx.actor.budget_remaining = 0;
             ctx.runtime.traceActorYielded(ctx.actor.id);
+            ctx.actor.wait_reason = .none;
             ctx.actor.state = .runnable;
             ctx.runtime.enqueue(ctx.actor);
             Fiber.yield();
+        }
+
+        /// Returns the cooperative I/O facade for this actor.
+        pub fn io(ctx: *@This()) std.Io {
+            return ctx.io_context.interface();
         }
 
         /// Spawns a child actor on the same runtime.
@@ -361,8 +420,10 @@ fn FunctionActorCell(comptime Msg: type, comptime entry: anytype) type {
                     .id = actor_id,
                     .msg_type = typeId(Msg),
                     .state = .runnable,
+                    .wait_reason = .none,
                     .queued = false,
                     .budget_remaining = 0,
+                    .io_budget_remaining = 0,
                     .next_run = null,
                     .fiber = undefined,
                     .stack = stack,
@@ -383,6 +444,7 @@ fn FunctionActorCell(comptime Msg: type, comptime entry: anytype) type {
                     .raw = cell.header.id,
                     .runtime = cell.header.runtime,
                 },
+                .io_context = .init(&cell.header.runtime.io.base, cell.header.runtime, &cell.header, chargeActorIo),
             };
             try entry(&ctx);
         }
@@ -418,8 +480,10 @@ fn StructActorCell(comptime Msg: type, comptime ActorType: type) type {
                     .id = actor_id,
                     .msg_type = typeId(Msg),
                     .state = .runnable,
+                    .wait_reason = .none,
                     .queued = false,
                     .budget_remaining = 0,
+                    .io_budget_remaining = 0,
                     .next_run = null,
                     .fiber = undefined,
                     .stack = stack,
@@ -441,6 +505,7 @@ fn StructActorCell(comptime Msg: type, comptime ActorType: type) type {
                     .raw = cell.header.id,
                     .runtime = cell.header.runtime,
                 },
+                .io_context = .init(&cell.header.runtime.io.base, cell.header.runtime, &cell.header, chargeActorIo),
             };
             try cell.actor.run(&ctx);
         }

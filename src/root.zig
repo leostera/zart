@@ -10,6 +10,7 @@ pub const Tracer = runtime.Tracer;
 pub const TraceEvent = runtime.TraceEvent;
 pub const MessageTrace = runtime.MessageTrace;
 pub const FailureTrace = runtime.FailureTrace;
+pub const Io = runtime.Io;
 pub const Ctx = runtime.Ctx;
 pub const MessageOf = runtime.MessageOf;
 
