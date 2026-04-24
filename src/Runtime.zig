@@ -118,6 +118,7 @@ pub const Runtime = struct {
     actors: Registry,
     retired: RetiredActors,
     workers: []Worker,
+    next_external_spawn_worker: std.atomic.Value(usize),
 
     /// Creates a runtime. `allocator` is exposed to actors through `ctx.allocator()`.
     pub fn init(allocator: Allocator, options: Options) RuntimeIo.InitError!Runtime {
@@ -153,6 +154,7 @@ pub const Runtime = struct {
             .actors = .{},
             .retired = .{},
             .workers = workers,
+            .next_external_spawn_worker = .init(0),
         };
     }
 
@@ -192,7 +194,75 @@ pub const Runtime = struct {
 
     /// Runs runnable actors until no runnable actor remains or an actor fails.
     pub fn run(rt: *Runtime) !void {
-        try rt.runWorker(0);
+        while (true) {
+            try rt.pollIo(.nonblocking);
+            rt.drainIoCompletions();
+
+            var made_progress = false;
+            for (rt.workers) |*current_worker| {
+                made_progress = try rt.runReadyActor(current_worker) or made_progress;
+            }
+            if (!made_progress) {
+                if (rt.io.hasPoller() and rt.io.hasPending()) {
+                    try rt.pollIo(.wait);
+                    rt.drainIoCompletions();
+                    continue;
+                }
+                return;
+            }
+        }
+    }
+
+    fn runReadyActor(rt: *Runtime, current_worker: *Worker) !bool {
+        const ready = rt.dequeue(current_worker) orelse return false;
+
+        defer rt.reclaimRetiredActors();
+
+        if (ready.loadState() != .runnable) return true;
+
+        ready.storeState(.running);
+        ready.wait_reason = .none;
+        ready.budget_remaining = rt.executionBudget();
+        ready.io_budget_remaining = rt.ioBudget();
+        rt.traceActorResumed(ready.id);
+        current_worker.setCurrent(ready);
+        current_actor_header = ready;
+        const status = ready.fiber.run() catch |err| {
+            current_actor_header = null;
+            current_worker.setCurrent(null);
+            return err;
+        };
+        current_actor_header = null;
+        current_worker.setCurrent(null);
+        switch (status) {
+            .created => unreachable,
+            .running => unreachable,
+            .suspended => switch (ready.loadState()) {
+                .running => {
+                    ready.storeState(.runnable);
+                    rt.enqueue(ready);
+                },
+                .runnable, .waiting => {},
+                .completed, .failed => unreachable,
+            },
+            .completed => {
+                ready.storeState(.completed);
+                rt.traceActorCompleted(ready.id);
+                rt.destroyActor(ready);
+            },
+            .failed => {
+                ready.storeState(.failed);
+                if (ready.fiber.failure()) |err| {
+                    rt.traceActorFailed(ready.id, err);
+                    rt.destroyActor(ready);
+                    rt.reclaimRetiredActors();
+                    return err;
+                }
+                unreachable;
+            },
+        }
+
+        return true;
     }
 
     fn runWorker(rt: *Runtime, worker_index: usize) !void {
@@ -202,59 +272,14 @@ pub const Runtime = struct {
             try rt.pollIo(.nonblocking);
             rt.drainIoCompletions();
 
-            const ready = rt.dequeue(current_worker) orelse {
+            if (!try rt.runReadyActor(current_worker)) {
                 if (rt.io.hasPoller() and rt.io.hasPending()) {
                     try rt.pollIo(.wait);
                     rt.drainIoCompletions();
                     continue;
                 }
                 return;
-            };
-
-            if (ready.loadState() != .runnable) continue;
-
-            ready.storeState(.running);
-            ready.wait_reason = .none;
-            ready.budget_remaining = rt.executionBudget();
-            ready.io_budget_remaining = rt.ioBudget();
-            rt.traceActorResumed(ready.id);
-            current_worker.setCurrent(ready);
-            current_actor_header = ready;
-            const status = ready.fiber.run() catch |err| {
-                current_actor_header = null;
-                current_worker.setCurrent(null);
-                return err;
-            };
-            current_actor_header = null;
-            current_worker.setCurrent(null);
-            switch (status) {
-                .created => unreachable,
-                .running => unreachable,
-                .suspended => switch (ready.loadState()) {
-                    .running => {
-                        ready.storeState(.runnable);
-                        rt.enqueue(ready);
-                    },
-                    .runnable, .waiting => {},
-                    .completed, .failed => unreachable,
-                },
-                .completed => {
-                    ready.storeState(.completed);
-                    rt.traceActorCompleted(ready.id);
-                    rt.destroyActor(ready);
-                },
-                .failed => {
-                    ready.storeState(.failed);
-                    if (ready.fiber.failure()) |err| {
-                        rt.traceActorFailed(ready.id, err);
-                        rt.destroyActor(ready);
-                        rt.reclaimRetiredActors();
-                        return err;
-                    }
-                    unreachable;
-                },
             }
-            rt.reclaimRetiredActors();
         }
     }
 
@@ -327,7 +352,8 @@ pub const Runtime = struct {
     }
 
     fn spawnOwnerWorker(rt: *Runtime) usize {
-        return if (rt.currentActor()) |current| current.owner_worker else 0;
+        if (rt.currentActor()) |current| return current.owner_worker;
+        return rt.next_external_spawn_worker.fetchAdd(1, .monotonic) % rt.workers.len;
     }
 
     fn currentActor(rt: *Runtime) ?*ActorHeader {
@@ -726,4 +752,43 @@ test "runtime creates one stack pool per configured worker" {
 
     try testing.expectEqual(@as(usize, 4), rt.workers.len);
     try testing.expectEqual(@as(usize, 4), rt.stacks.len);
+}
+
+test "runtime distributes external spawns across configured workers" {
+    const testing = std.testing;
+
+    const StopMsg = union(enum) {
+        stop,
+    };
+
+    const Stopper = struct {
+        pub const Msg = StopMsg;
+
+        stopped: *usize,
+
+        pub fn run(self: *@This(), ctx: *Ctx(StopMsg)) !void {
+            switch (try ctx.recv()) {
+                .stop => self.stopped.* += 1,
+            }
+        }
+    };
+
+    var rt = try Runtime.init(testing.allocator, .{
+        .worker_count = 2,
+        .preallocate_stack_slab = false,
+    });
+    defer rt.deinit();
+
+    var stopped: usize = 0;
+    const first = try rt.spawn(Stopper{ .stopped = &stopped });
+    const second = try rt.spawn(Stopper{ .stopped = &stopped });
+
+    try testing.expectEqual(@as(usize, 0), rt.actors.get(first.any()).?.owner_worker);
+    try testing.expectEqual(@as(usize, 1), rt.actors.get(second.any()).?.owner_worker);
+
+    try first.send(.stop);
+    try second.send(.stop);
+    try rt.run();
+
+    try testing.expectEqual(@as(usize, 2), stopped);
 }
