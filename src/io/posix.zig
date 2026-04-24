@@ -50,6 +50,7 @@ pub const Posix = struct {
             .context = self,
             .submit_fn = submit,
             .poll_fn = poll,
+            .wake_fn = wake,
         };
     }
 
@@ -88,6 +89,11 @@ pub const Posix = struct {
             self.mutex.unlock(std.Options.debug_io);
             if (mode == .nonblocking or completed_any or empty) return;
         }
+    }
+
+    fn wake(context: ?*anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(context.?));
+        self.wakePoller();
     }
 
     fn enqueue(self: *Self, request: *RuntimeIo.Request) void {

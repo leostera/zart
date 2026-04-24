@@ -385,11 +385,13 @@ pub const Runtime = struct {
     }
 
     fn closeWorkers(rt: *Runtime) void {
+        rt.io.wakePoller();
         for (rt.workers) |*target_worker| target_worker.close(rt.options.scheduler_io);
     }
 
     fn requestSmpQuiesce(rt: *Runtime) void {
         rt.smp_quiescing.store(true, .release);
+        rt.io.wakePoller();
         for (rt.workers) |*target_worker| target_worker.notify(rt.options.scheduler_io);
     }
 

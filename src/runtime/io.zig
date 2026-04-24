@@ -16,6 +16,7 @@ pub const RuntimeIo = struct {
         context: ?*anyopaque = null,
         submit_fn: *const fn (?*anyopaque, *Request) void,
         poll_fn: ?*const fn (?*anyopaque, PollMode) anyerror!void = null,
+        wake_fn: ?*const fn (?*anyopaque) void = null,
 
         pub fn submit(driver: Driver, request: *Request) void {
             driver.submit_fn(driver.context, request);
@@ -24,6 +25,11 @@ pub const RuntimeIo = struct {
         pub fn poll(driver: Driver, mode: PollMode) !void {
             const poll_fn = driver.poll_fn orelse return;
             try poll_fn(driver.context, mode);
+        }
+
+        pub fn wake(driver: Driver) void {
+            const wake_fn = driver.wake_fn orelse return;
+            wake_fn(driver.context);
         }
     };
 
@@ -326,6 +332,11 @@ pub const RuntimeIo = struct {
     pub fn poll(runtime_io: *RuntimeIo, mode: PollMode) !void {
         const driver = runtime_io.shared.driver orelse return;
         try driver.poll(mode);
+    }
+
+    pub fn wakePoller(runtime_io: *RuntimeIo) void {
+        const driver = runtime_io.shared.driver orelse return;
+        driver.wake();
     }
 
     pub fn popCompletion(runtime_io: *RuntimeIo, sync_io: std.Io) ?*Request {
