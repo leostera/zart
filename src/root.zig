@@ -26,4 +26,5 @@ test {
     _ = Fiber;
     _ = testing;
     _ = @import("runtime/parker.zig");
+    _ = @import("runtime/scheduler.zig");
 }

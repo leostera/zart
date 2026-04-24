@@ -5,6 +5,7 @@ const inbox = @import("runtime/inbox.zig");
 const concrete_io = @import("io.zig");
 const io = @import("runtime/io.zig");
 const registry = @import("runtime/registry.zig");
+const scheduler = @import("runtime/scheduler.zig");
 const stack_pool = @import("runtime/stack_pool.zig");
 const trace = @import("runtime/trace.zig");
 
@@ -25,6 +26,7 @@ pub const PosixIo = concrete_io.Posix;
 const ActorIoContext = io.ActorIoContext;
 const RuntimeIo = io.RuntimeIo;
 const Registry = registry.Registry(ActorHeader);
+const Scheduler = scheduler.Scheduler(ActorHeader);
 const StackPool = stack_pool.StackPool;
 
 const ActorState = enum {
@@ -92,9 +94,7 @@ pub const Runtime = struct {
     io: RuntimeIo,
     stacks: StackPool,
     actors: Registry,
-    run_head: ?*ActorHeader,
-    run_tail: ?*ActorHeader,
-    current_actor: ?*ActorHeader,
+    scheduler: Scheduler,
 
     /// Creates a runtime. `allocator` is exposed to actors through `ctx.allocator()`.
     pub fn init(allocator: Allocator, options: Options) RuntimeIo.InitError!Runtime {
@@ -113,9 +113,7 @@ pub const Runtime = struct {
             .io = runtime_io,
             .stacks = stacks,
             .actors = .{},
-            .run_head = null,
-            .run_tail = null,
-            .current_actor = null,
+            .scheduler = .{},
         };
     }
 
@@ -172,12 +170,12 @@ pub const Runtime = struct {
             ready.budget_remaining = rt.executionBudget();
             ready.io_budget_remaining = rt.ioBudget();
             rt.traceActorResumed(ready.id);
-            rt.current_actor = ready;
+            rt.scheduler.setCurrent(ready);
             const status = ready.fiber.run() catch |err| {
-                rt.current_actor = null;
+                rt.scheduler.setCurrent(null);
                 return err;
             };
-            rt.current_actor = null;
+            rt.scheduler.setCurrent(null);
             switch (status) {
                 .created => unreachable,
                 .running => unreachable,
@@ -280,26 +278,11 @@ pub const Runtime = struct {
     }
 
     fn enqueue(rt: *Runtime, target: *ActorHeader) void {
-        if (target.queued) return;
-        target.queued = true;
-        target.next_run = null;
-
-        if (rt.run_tail) |tail| {
-            tail.next_run = target;
-        } else {
-            rt.run_head = target;
-        }
-        rt.run_tail = target;
+        rt.scheduler.enqueue(target);
     }
 
     fn dequeue(rt: *Runtime) ?*ActorHeader {
-        const target = rt.run_head orelse return null;
-        rt.run_head = target.next_run;
-        if (rt.run_head == null) rt.run_tail = null;
-
-        target.next_run = null;
-        target.queued = false;
-        return target;
+        return rt.scheduler.dequeue();
     }
 
     fn destroyActor(rt: *Runtime, target: *ActorHeader) void {
@@ -389,7 +372,7 @@ pub const Runtime = struct {
         if (rt.options.tracer) |tracer| {
             tracer.record(.{
                 .message_sent = .{
-                    .from = if (rt.current_actor) |current| current.id else null,
+                    .from = if (rt.scheduler.current_actor) |current| current.id else null,
                     .to = to,
                 },
             });
