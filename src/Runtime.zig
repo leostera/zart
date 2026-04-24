@@ -45,6 +45,13 @@ const WaitReason = enum(u8) {
     io,
 };
 
+const RuntimeState = enum(u8) {
+    idle,
+    running,
+    stopping,
+    stopped,
+};
+
 const ActorHeader = struct {
     runtime: *Runtime,
     id: ActorId,
@@ -95,6 +102,8 @@ threadlocal var current_actor_header: ?*ActorHeader = null;
 /// boundaries keep the core ready for the planned SMP scheduler and work
 /// stealing queues.
 pub const Runtime = struct {
+    pub const State = RuntimeState;
+
     pub const Options = struct {
         /// Stack bytes allocated for each actor fiber.
         stack_size: usize = 64 * 1024,
@@ -127,6 +136,7 @@ pub const Runtime = struct {
     retired: RetiredActors,
     workers: []Worker,
     next_external_spawn_worker: std.atomic.Value(usize),
+    lifecycle: std.atomic.Value(RuntimeState),
 
     /// Creates a runtime. `allocator` is exposed to actors through `ctx.allocator()`.
     pub fn init(allocator: Allocator, options: Options) RuntimeIo.InitError!Runtime {
@@ -163,6 +173,7 @@ pub const Runtime = struct {
             .retired = .{},
             .workers = workers,
             .next_external_spawn_worker = .init(0),
+            .lifecycle = .init(.idle),
         };
     }
 
@@ -194,15 +205,37 @@ pub const Runtime = struct {
 
     /// Sends a message to a raw actor id. Prefer `Actor(Msg).send` in user code.
     pub fn send(rt: *Runtime, comptime Msg: type, actor_id: ActorId, msg: Msg) !void {
+        if (rt.state() == .stopped) return error.RuntimeStopped;
+
         const target = try rt.resolve(Msg, actor_id);
         rt.traceMessageSent(target.id);
         try target.send_fn(target, &msg);
         rt.wake(target);
     }
 
+    /// Requests runtime shutdown and wakes any parked workers.
+    pub fn stop(rt: *Runtime) void {
+        const previous = rt.lifecycle.swap(.stopping, .acq_rel);
+        if (previous == .stopped) {
+            rt.lifecycle.store(.stopped, .release);
+            return;
+        }
+        rt.closeWorkers();
+    }
+
+    /// Returns the runtime lifecycle state.
+    pub fn state(rt: *const Runtime) State {
+        return rt.lifecycle.load(.acquire);
+    }
+
     /// Runs runnable actors until no runnable actor remains or an actor fails.
     pub fn run(rt: *Runtime) !void {
+        try rt.enterRun();
+        defer rt.leaveRun();
+
         while (true) {
+            if (rt.isStopping()) return;
+
             try rt.pollIo(.nonblocking);
             rt.drainIoCompletions();
 
@@ -219,6 +252,45 @@ pub const Runtime = struct {
                 return;
             }
         }
+    }
+
+    fn enterRun(rt: *Runtime) !void {
+        while (true) {
+            switch (rt.lifecycle.load(.acquire)) {
+                .idle => {
+                    if (rt.lifecycle.cmpxchgStrong(.idle, .running, .acq_rel, .acquire) == null) return;
+                },
+                .running => return error.RuntimeAlreadyRunning,
+                .stopping => return,
+                .stopped => return error.RuntimeStopped,
+            }
+        }
+    }
+
+    fn leaveRun(rt: *Runtime) void {
+        while (true) {
+            switch (rt.lifecycle.load(.acquire)) {
+                .running => {
+                    if (rt.lifecycle.cmpxchgStrong(.running, .idle, .acq_rel, .acquire) == null) return;
+                },
+                .stopping => {
+                    rt.lifecycle.store(.stopped, .release);
+                    return;
+                },
+                .idle, .stopped => return,
+            }
+        }
+    }
+
+    fn isStopping(rt: *const Runtime) bool {
+        return switch (rt.state()) {
+            .stopping, .stopped => true,
+            .idle, .running => false,
+        };
+    }
+
+    fn closeWorkers(rt: *Runtime) void {
+        for (rt.workers) |*target_worker| target_worker.close(rt.options.scheduler_io);
     }
 
     fn runReadyActor(rt: *Runtime, current_worker: *Worker) !bool {
@@ -603,6 +675,11 @@ pub fn Ctx(comptime Msg: type) type {
             return ctx.self_actor;
         }
 
+        /// Requests runtime shutdown after the current actor turn.
+        pub fn stop(ctx: *const @This()) void {
+            ctx.runtime.stop();
+        }
+
         /// Returns the user allocator provided to `Runtime.init`.
         pub fn allocator(ctx: *const @This()) Allocator {
             return ctx.runtime.allocator;
@@ -799,4 +876,77 @@ test "runtime distributes external spawns across configured workers" {
     try rt.run();
 
     try testing.expectEqual(@as(usize, 2), stopped);
+}
+
+test "runtime returns to idle after a normal run" {
+    const testing = std.testing;
+
+    const StopMsg = union(enum) {
+        stop,
+    };
+
+    const Stopper = struct {
+        pub const Msg = StopMsg;
+
+        pub fn run(_: *@This(), ctx: *Ctx(StopMsg)) !void {
+            _ = try ctx.recv();
+        }
+    };
+
+    var rt = try Runtime.init(testing.allocator, .{});
+    defer rt.deinit();
+
+    const stopper = try rt.spawn(Stopper{});
+    try stopper.send(.stop);
+    try rt.run();
+
+    try testing.expectEqual(Runtime.State.idle, rt.state());
+}
+
+test "runtime stop exits after current actor turn" {
+    const testing = std.testing;
+
+    const RunMsg = union(enum) {
+        run,
+    };
+
+    const Stopper = struct {
+        pub const Msg = RunMsg;
+
+        ran: *bool,
+
+        pub fn run(self: *@This(), ctx: *Ctx(RunMsg)) !void {
+            _ = try ctx.recv();
+            self.ran.* = true;
+            ctx.stop();
+        }
+    };
+
+    const Observer = struct {
+        pub const Msg = RunMsg;
+
+        ran: *bool,
+
+        pub fn run(self: *@This(), ctx: *Ctx(RunMsg)) !void {
+            _ = try ctx.recv();
+            self.ran.* = true;
+        }
+    };
+
+    var rt = try Runtime.init(testing.allocator, .{});
+    defer rt.deinit();
+
+    var stopper_ran = false;
+    var observer_ran = false;
+    const stopper = try rt.spawn(Stopper{ .ran = &stopper_ran });
+    const observer = try rt.spawn(Observer{ .ran = &observer_ran });
+
+    try stopper.send(.run);
+    try observer.send(.run);
+    try rt.run();
+
+    try testing.expect(stopper_ran);
+    try testing.expect(!observer_ran);
+    try testing.expectEqual(Runtime.State.stopped, rt.state());
+    try testing.expectError(error.RuntimeStopped, observer.send(.run));
 }
