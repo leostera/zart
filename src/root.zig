@@ -4,8 +4,8 @@ const runtime = @import("Runtime.zig");
 
 pub const Fiber = @import("Fiber.zig");
 pub const Runtime = runtime.Runtime;
-pub const AnyActorId = runtime.AnyActorId;
 pub const ActorId = runtime.ActorId;
+pub const Actor = runtime.Actor;
 pub const Tracer = runtime.Tracer;
 pub const TraceEvent = runtime.TraceEvent;
 pub const MessageTrace = runtime.MessageTrace;

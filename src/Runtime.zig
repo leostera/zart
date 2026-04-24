@@ -3,30 +3,30 @@ const Fiber = @import("Fiber.zig");
 
 const Allocator = std.mem.Allocator;
 
-pub const AnyActorId = struct {
+pub const ActorId = struct {
     index: usize,
     generation: u32,
 };
 
 pub const MessageTrace = struct {
-    from: ?AnyActorId,
-    to: AnyActorId,
+    from: ?ActorId,
+    to: ActorId,
 };
 
 pub const FailureTrace = struct {
-    actor: AnyActorId,
+    actor: ActorId,
     err: anyerror,
 };
 
 pub const TraceEvent = union(enum) {
-    actor_spawned: AnyActorId,
-    actor_resumed: AnyActorId,
-    actor_waiting: AnyActorId,
-    actor_yielded: AnyActorId,
-    actor_completed: AnyActorId,
+    actor_spawned: ActorId,
+    actor_resumed: ActorId,
+    actor_waiting: ActorId,
+    actor_yielded: ActorId,
+    actor_completed: ActorId,
     actor_failed: FailureTrace,
     message_sent: MessageTrace,
-    message_received: AnyActorId,
+    message_received: ActorId,
 };
 
 pub const Tracer = struct {
@@ -48,7 +48,7 @@ const ActorState = enum {
 
 const ActorHeader = struct {
     runtime: *Runtime,
-    id: AnyActorId,
+    id: ActorId,
     msg_type: usize,
     state: ActorState,
     queued: bool,
@@ -97,18 +97,18 @@ pub const Runtime = struct {
         rt.* = undefined;
     }
 
-    pub fn spawn(rt: *Runtime, actor: anytype) !ActorId(MessageOf(@TypeOf(actor))) {
-        const Actor = @TypeOf(actor);
-        const Msg = MessageOf(Actor);
+    pub fn spawn(rt: *Runtime, actor: anytype) !Actor(MessageOf(@TypeOf(actor))) {
+        const ActorType = @TypeOf(actor);
+        const Msg = MessageOf(ActorType);
 
-        return switch (@typeInfo(Actor)) {
+        return switch (@typeInfo(ActorType)) {
             .@"fn" => rt.spawnFunction(Msg, actor),
-            .@"struct" => rt.spawnStruct(Msg, Actor, actor),
+            .@"struct" => rt.spawnStruct(Msg, ActorType, actor),
             else => @compileError("spawn expects a function actor or a struct actor with pub const Msg and pub fn run"),
         };
     }
 
-    pub fn send(rt: *Runtime, comptime Msg: type, actor_id: AnyActorId, msg: Msg) !void {
+    pub fn send(rt: *Runtime, comptime Msg: type, actor_id: ActorId, msg: Msg) !void {
         const actor = try rt.resolve(Msg, actor_id);
         rt.traceMessageSent(actor.id);
         try actor.send_fn(actor, &msg);
@@ -154,17 +154,17 @@ pub const Runtime = struct {
         }
     }
 
-    fn spawnFunction(rt: *Runtime, comptime Msg: type, comptime entry: anytype) !ActorId(Msg) {
+    fn spawnFunction(rt: *Runtime, comptime Msg: type, comptime entry: anytype) !Actor(Msg) {
         const Cell = FunctionActorCell(Msg, entry);
         return rt.spawnCell(Msg, Cell, {});
     }
 
-    fn spawnStruct(rt: *Runtime, comptime Msg: type, comptime Actor: type, actor: Actor) !ActorId(Msg) {
-        const Cell = StructActorCell(Msg, Actor);
+    fn spawnStruct(rt: *Runtime, comptime Msg: type, comptime ActorType: type, actor: ActorType) !Actor(Msg) {
+        const Cell = StructActorCell(Msg, ActorType);
         return rt.spawnCell(Msg, Cell, actor);
     }
 
-    fn spawnCell(rt: *Runtime, comptime Msg: type, comptime Cell: type, actor_value: anytype) !ActorId(Msg) {
+    fn spawnCell(rt: *Runtime, comptime Msg: type, comptime Cell: type, actor_value: anytype) !Actor(Msg) {
         const cell = try rt.internal_allocator.create(Cell);
         errdefer rt.internal_allocator.destroy(cell);
 
@@ -175,7 +175,7 @@ pub const Runtime = struct {
         );
         errdefer rt.internal_allocator.free(stack);
 
-        const actor_id: AnyActorId = .{
+        const actor_id: ActorId = .{
             .index = rt.actors.items.len,
             .generation = 1,
         };
@@ -194,7 +194,7 @@ pub const Runtime = struct {
         };
     }
 
-    fn resolve(rt: *Runtime, comptime Msg: type, actor_id: AnyActorId) !*ActorHeader {
+    fn resolve(rt: *Runtime, comptime Msg: type, actor_id: ActorId) !*ActorHeader {
         if (actor_id.index >= rt.actors.items.len) return error.InvalidActor;
 
         const actor = rt.actors.items[actor_id.index] orelse return error.InvalidActor;
@@ -245,33 +245,33 @@ pub const Runtime = struct {
         return @max(rt.options.execution_budget, 1);
     }
 
-    fn traceActorSpawned(rt: *Runtime, actor_id: AnyActorId) void {
+    fn traceActorSpawned(rt: *Runtime, actor_id: ActorId) void {
         if (rt.options.tracer) |tracer| tracer.record(.{ .actor_spawned = actor_id });
     }
 
-    fn traceActorResumed(rt: *Runtime, actor_id: AnyActorId) void {
+    fn traceActorResumed(rt: *Runtime, actor_id: ActorId) void {
         if (rt.options.tracer) |tracer| tracer.record(.{ .actor_resumed = actor_id });
     }
 
-    fn traceActorWaiting(rt: *Runtime, actor_id: AnyActorId) void {
+    fn traceActorWaiting(rt: *Runtime, actor_id: ActorId) void {
         if (rt.options.tracer) |tracer| tracer.record(.{ .actor_waiting = actor_id });
     }
 
-    fn traceActorYielded(rt: *Runtime, actor_id: AnyActorId) void {
+    fn traceActorYielded(rt: *Runtime, actor_id: ActorId) void {
         if (rt.options.tracer) |tracer| tracer.record(.{ .actor_yielded = actor_id });
     }
 
-    fn traceActorCompleted(rt: *Runtime, actor_id: AnyActorId) void {
+    fn traceActorCompleted(rt: *Runtime, actor_id: ActorId) void {
         if (rt.options.tracer) |tracer| tracer.record(.{ .actor_completed = actor_id });
     }
 
-    fn traceActorFailed(rt: *Runtime, actor_id: AnyActorId, err: anyerror) void {
+    fn traceActorFailed(rt: *Runtime, actor_id: ActorId, err: anyerror) void {
         if (rt.options.tracer) |tracer| {
             tracer.record(.{ .actor_failed = .{ .actor = actor_id, .err = err } });
         }
     }
 
-    fn traceMessageSent(rt: *Runtime, to: AnyActorId) void {
+    fn traceMessageSent(rt: *Runtime, to: ActorId) void {
         if (rt.options.tracer) |tracer| {
             tracer.record(.{
                 .message_sent = .{
@@ -282,23 +282,23 @@ pub const Runtime = struct {
         }
     }
 
-    fn traceMessageReceived(rt: *Runtime, actor_id: AnyActorId) void {
+    fn traceMessageReceived(rt: *Runtime, actor_id: ActorId) void {
         if (rt.options.tracer) |tracer| tracer.record(.{ .message_received = actor_id });
     }
 };
 
-pub fn ActorId(comptime Msg: type) type {
+pub fn Actor(comptime Msg: type) type {
     return struct {
         pub const Message = Msg;
 
-        raw: AnyActorId,
+        raw: ActorId,
         runtime: *Runtime,
 
         pub fn send(actor_id: @This(), msg: Msg) !void {
             try actor_id.runtime.send(Msg, actor_id.raw, msg);
         }
 
-        pub fn any(actor_id: @This()) AnyActorId {
+        pub fn any(actor_id: @This()) ActorId {
             return actor_id.raw;
         }
     };
@@ -311,7 +311,7 @@ pub fn Ctx(comptime Msg: type) type {
         runtime: *Runtime,
         actor: *ActorHeader,
         inbox: *Inbox(Msg),
-        self_actor: ActorId(Msg),
+        self_actor: Actor(Msg),
 
         pub fn recv(ctx: *@This()) !Msg {
             while (true) {
@@ -339,11 +339,11 @@ pub fn Ctx(comptime Msg: type) type {
             Fiber.yield();
         }
 
-        pub fn spawn(ctx: *@This(), actor: anytype) !ActorId(MessageOf(@TypeOf(actor))) {
+        pub fn spawn(ctx: *@This(), actor: anytype) !Actor(MessageOf(@TypeOf(actor))) {
             return ctx.runtime.spawn(actor);
         }
 
-        pub fn self(ctx: *const @This()) ActorId(Msg) {
+        pub fn self(ctx: *const @This()) Actor(Msg) {
             return ctx.self_actor;
         }
 
@@ -353,17 +353,17 @@ pub fn Ctx(comptime Msg: type) type {
     };
 }
 
-pub fn MessageOf(comptime Actor: type) type {
-    return switch (@typeInfo(Actor)) {
-        .@"fn" => messageOfFunction(Actor),
+pub fn MessageOf(comptime ActorType: type) type {
+    return switch (@typeInfo(ActorType)) {
+        .@"fn" => messageOfFunction(ActorType),
         .@"struct" => {
-            if (!@hasDecl(Actor, "Msg")) {
+            if (!@hasDecl(ActorType, "Msg")) {
                 @compileError("struct actor must declare pub const Msg");
             }
-            if (!@hasDecl(Actor, "run")) {
+            if (!@hasDecl(ActorType, "run")) {
                 @compileError("struct actor must declare pub fn run(self: *@This(), ctx: *zart.Ctx(Msg)) !void");
             }
-            return Actor.Msg;
+            return ActorType.Msg;
         },
         else => @compileError("actor must be a function or struct"),
     };
@@ -397,7 +397,7 @@ fn FunctionActorCell(comptime Msg: type, comptime entry: anytype) type {
 
         const Self = @This();
 
-        fn init(rt: *Runtime, actor_id: AnyActorId, stack: []align(Fiber.stack_alignment) u8, _: void) Self {
+        fn init(rt: *Runtime, actor_id: ActorId, stack: []align(Fiber.stack_alignment) u8, _: void) Self {
             return .{
                 .header = .{
                     .runtime = rt,
@@ -446,15 +446,15 @@ fn FunctionActorCell(comptime Msg: type, comptime entry: anytype) type {
     };
 }
 
-fn StructActorCell(comptime Msg: type, comptime Actor: type) type {
+fn StructActorCell(comptime Msg: type, comptime ActorType: type) type {
     return struct {
         header: ActorHeader,
         inbox: Inbox(Msg),
-        actor: Actor,
+        actor: ActorType,
 
         const Self = @This();
 
-        fn init(rt: *Runtime, actor_id: AnyActorId, stack: []align(Fiber.stack_alignment) u8, actor: Actor) Self {
+        fn init(rt: *Runtime, actor_id: ActorId, stack: []align(Fiber.stack_alignment) u8, actor: ActorType) Self {
             return .{
                 .header = .{
                     .runtime = rt,
@@ -576,7 +576,7 @@ test "function actor counter" {
 
     const CounterMsg = union(enum) {
         inc: u64,
-        get: ActorId(Reply),
+        get: Actor(Reply),
         stop,
     };
 
@@ -632,7 +632,7 @@ test "struct actor counter" {
 
     const CounterMsg = union(enum) {
         inc: u64,
-        get: ActorId(Reply),
+        get: Actor(Reply),
         stop,
     };
 
@@ -706,7 +706,7 @@ test "yield lets another runnable actor run" {
     };
 
     const WorkerMsg = union(enum) {
-        start: ActorId(OtherMsg),
+        start: Actor(OtherMsg),
     };
 
     const Actors = struct {
@@ -777,7 +777,7 @@ test "execution budget controls yield switching" {
     };
 
     const WorkerMsg = union(enum) {
-        start: ActorId(OtherMsg),
+        start: Actor(OtherMsg),
     };
 
     const Actors = struct {
@@ -834,11 +834,11 @@ test "actor can spawn child actor" {
     };
 
     const ChildMsg = union(enum) {
-        report: ActorId(Reply),
+        report: Actor(Reply),
     };
 
     const ParentMsg = union(enum) {
-        start: ActorId(Reply),
+        start: Actor(Reply),
     };
 
     const Actors = struct {
@@ -916,7 +916,7 @@ test "tracer records runtime events" {
         }
     };
 
-    const Actor = struct {
+    const StopActor = struct {
         pub const Msg = StopMsg;
 
         pub fn run(_: *@This(), ctx: *Ctx(StopMsg)) !void {
@@ -930,7 +930,7 @@ test "tracer records runtime events" {
     var rt = Runtime.init(testing.allocator, .{ .tracer = recorder.tracer() });
     defer rt.deinit();
 
-    const actor = try rt.spawn(Actor{});
+    const actor = try rt.spawn(StopActor{});
     try actor.send(.stop);
     try rt.run();
 
@@ -943,7 +943,7 @@ test "tracer records runtime events" {
 
     switch (recorder.events[1]) {
         .message_sent => |message| {
-            try testing.expectEqual(@as(?AnyActorId, null), message.from);
+            try testing.expectEqual(@as(?ActorId, null), message.from);
             try testing.expectEqual(actor.any(), message.to);
         },
         else => return error.UnexpectedTraceEvent,
