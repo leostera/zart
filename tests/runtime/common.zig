@@ -6,6 +6,7 @@ pub const ActorId = zart.ActorId;
 pub const Ctx = zart.Ctx;
 pub const Fiber = zart.Fiber;
 pub const IoDriver = zart.IoDriver;
+pub const IoPollMode = zart.IoPollMode;
 pub const IoRequest = zart.IoRequest;
 pub const DefaultIo = zart.io.Default;
 pub const PosixIo = zart.io.Posix;

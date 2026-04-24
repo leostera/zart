@@ -21,6 +21,7 @@ pub const Tracer = trace.Tracer;
 pub const MessageOf = actor.MessageOf;
 pub const Io = std.Io;
 pub const IoDriver = RuntimeIo.Driver;
+pub const IoPollMode = RuntimeIo.PollMode;
 pub const IoRequest = RuntimeIo.Request;
 pub const DefaultIo = concrete_io.Default;
 pub const PosixIo = concrete_io.Posix;

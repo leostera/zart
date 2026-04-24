@@ -13,6 +13,7 @@ pub const MessageTrace = runtime.MessageTrace;
 pub const FailureTrace = runtime.FailureTrace;
 pub const Io = runtime.Io;
 pub const IoDriver = runtime.IoDriver;
+pub const IoPollMode = runtime.IoPollMode;
 pub const IoRequest = runtime.IoRequest;
 pub const DefaultIo = runtime.DefaultIo;
 pub const PosixIo = runtime.PosixIo;

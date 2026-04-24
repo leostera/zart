@@ -1,8 +1,10 @@
 const common = @import("common.zig");
 const std = common.std;
+const Actor = common.Actor;
 const Ctx = common.Ctx;
 const DefaultIo = common.DefaultIo;
 const IoDriver = common.IoDriver;
+const IoPollMode = common.IoPollMode;
 const IoRequest = common.IoRequest;
 const Runtime = common.Runtime;
 const zart = common.zart;
@@ -469,6 +471,195 @@ test "std Io batch waits park actor until non-blocking driver completion" {
     try testing.expectEqualStrings("abcd", trace.slice());
     try testing.expectEqual(@as(usize, 1), fake_driver.async_calls);
     try testing.expectEqual(@as(usize, 1), fake_driver.concurrent_calls);
+}
+
+test "randomized non-blocking io completions survive immediate poll and cross-thread ordering" {
+    const testing = std.testing;
+
+    const ActorCount = 12;
+
+    const ResultMsg = union(enum) {
+        value: usize,
+    };
+
+    const WorkerMsg = union(enum) {
+        start: Actor(ResultMsg),
+    };
+
+    const Driver = struct {
+        mutex: std.Io.Mutex = .init,
+        condition: std.Io.Condition = .init,
+        pending: [ActorCount]Entry = undefined,
+        pending_len: usize = 0,
+        submitted: usize = 0,
+        thread_completed: usize = 0,
+
+        const Self = @This();
+        const ThreadCompletionCount = 3;
+
+        const Entry = struct {
+            request: *IoRequest,
+            id: usize,
+        };
+
+        fn driver(self: *Self) IoDriver {
+            return .{
+                .context = self,
+                .submit_fn = submit,
+                .poll_fn = poll,
+            };
+        }
+
+        fn submit(context: ?*anyopaque, request: *IoRequest) void {
+            const self: *Self = @ptrCast(@alignCast(context.?));
+
+            self.mutex.lockUncancelable(testing.io);
+            const id = self.submitted;
+            self.submitted += 1;
+            if (id % 4 == 0) {
+                self.mutex.unlock(testing.io);
+                request.completeOperate(.{ .file_read_streaming = id });
+                return;
+            }
+
+            self.pending[self.pending_len] = .{
+                .request = request,
+                .id = id,
+            };
+            self.pending_len += 1;
+            self.condition.signal(testing.io);
+            self.mutex.unlock(testing.io);
+        }
+
+        fn poll(context: ?*anyopaque, _: IoPollMode) !void {
+            const self: *Self = @ptrCast(@alignCast(context.?));
+            var ready: [ActorCount]Entry = undefined;
+            var ready_len: usize = 0;
+
+            self.mutex.lockUncancelable(testing.io);
+            var index = self.pending_len;
+            while (index != 0) {
+                index -= 1;
+                if (self.pending[index].id % 4 == 1) continue;
+
+                ready[ready_len] = self.pending[index];
+                ready_len += 1;
+                self.removeAt(index);
+            }
+            self.mutex.unlock(testing.io);
+
+            for (ready[0..ready_len]) |entry| {
+                entry.request.completeOperate(.{ .file_read_streaming = entry.id });
+            }
+        }
+
+        fn completeFromThread(self: *Self) void {
+            while (true) {
+                self.mutex.lockUncancelable(testing.io);
+                while (self.findThreadPending() == null and self.thread_completed < ThreadCompletionCount) {
+                    self.condition.waitUncancelable(testing.io, &self.mutex);
+                }
+                if (self.thread_completed == ThreadCompletionCount) {
+                    self.mutex.unlock(testing.io);
+                    return;
+                }
+
+                const index = self.findThreadPending().?;
+                const entry = self.pending[index];
+                self.removeAt(index);
+                self.thread_completed += 1;
+                self.mutex.unlock(testing.io);
+
+                entry.request.completeOperate(.{ .file_read_streaming = entry.id });
+            }
+        }
+
+        fn findThreadPending(self: *Self) ?usize {
+            for (self.pending[0..self.pending_len], 0..) |entry, index| {
+                if (entry.id % 4 == 1) return index;
+            }
+            return null;
+        }
+
+        fn removeAt(self: *Self, index: usize) void {
+            const last = self.pending_len - 1;
+            self.pending[index] = self.pending[last];
+            self.pending_len = last;
+        }
+    };
+
+    const Actors = struct {
+        const Worker = struct {
+            pub const Msg = WorkerMsg;
+
+            pub fn run(_: *@This(), ctx: *Ctx(Msg)) !void {
+                switch (try ctx.recv()) {
+                    .start => |reply_to| {
+                        var buffer: [1]u8 = undefined;
+                        var buffers = [_][]u8{buffer[0..]};
+                        const result = try std.Io.operate(ctx.io(), .{
+                            .file_read_streaming = .{
+                                .file = .stdin(),
+                                .data = &buffers,
+                            },
+                        });
+                        switch (result) {
+                            .file_read_streaming => |read_result| try reply_to.send(.{ .value = try read_result }),
+                            else => unreachable,
+                        }
+                    },
+                }
+            }
+        };
+
+        const Collector = struct {
+            pub const Msg = ResultMsg;
+
+            seen: *[ActorCount]bool,
+            count: *usize,
+
+            pub fn run(self: *@This(), ctx: *Ctx(Msg)) !void {
+                while (self.count.* < ActorCount) {
+                    switch (try ctx.recv()) {
+                        .value => |value| {
+                            try testing.expect(value < ActorCount);
+                            try testing.expect(!self.seen[value]);
+                            self.seen[value] = true;
+                            self.count.* += 1;
+                        },
+                    }
+                }
+            }
+        };
+    };
+
+    var driver: Driver = .{};
+    var rt = try Runtime.init(testing.allocator, .{
+        .worker_count = 4,
+        .execution_budget = 1,
+        .preallocate_stack_slab = false,
+        .io = driver.driver(),
+    });
+    defer rt.deinit();
+
+    var seen = [_]bool{false} ** ActorCount;
+    var count: usize = 0;
+    const collector = try rt.spawn(Actors.Collector{
+        .seen = &seen,
+        .count = &count,
+    });
+
+    for (0..ActorCount) |_| {
+        const worker = try rt.spawn(Actors.Worker{});
+        try worker.send(.{ .start = collector });
+    }
+
+    const completer = try std.Thread.spawn(.{}, Driver.completeFromThread, .{&driver});
+    try rt.run();
+    completer.join();
+
+    try testing.expectEqual(@as(usize, ActorCount), count);
+    for (seen) |item_seen| try testing.expect(item_seen);
 }
 
 test "posix io driver reads files through ctx io" {
