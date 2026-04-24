@@ -249,6 +249,100 @@ test "smp fuzzed actor graph message cascades match reference counts" {
     }
 }
 
+test "smp stress fanout fanin with frequent cooperative yields" {
+    const testing = std.testing;
+
+    const WorkerCount = 32;
+    const MessageCount = 2048;
+
+    const CollectorMsg = union(enum) {
+        done: usize,
+    };
+
+    const WorkerMsg = union(enum) {
+        task: struct {
+            value: usize,
+            reply_to: Actor(CollectorMsg),
+        },
+        stop,
+    };
+
+    const Collector = struct {
+        pub const Msg = CollectorMsg;
+
+        expected: usize,
+        count: *usize,
+        sum: *usize,
+
+        pub fn run(self: *@This(), ctx: *Ctx(CollectorMsg)) !void {
+            while (self.count.* < self.expected) {
+                switch (try ctx.recv()) {
+                    .done => |value| {
+                        self.count.* += 1;
+                        self.sum.* += value;
+                    },
+                }
+                ctx.yield();
+            }
+        }
+    };
+
+    const WorkerActor = struct {
+        pub const Msg = WorkerMsg;
+
+        pub fn run(_: *@This(), ctx: *Ctx(WorkerMsg)) !void {
+            while (true) {
+                switch (try ctx.recv()) {
+                    .task => |task| try task.reply_to.send(.{ .done = task.value }),
+                    .stop => return,
+                }
+                ctx.yield();
+            }
+        }
+    };
+
+    for (zart.testing.seeds[0..6]) |seed| {
+        var rt = try Runtime.init(testing.allocator, .{
+            .worker_count = 4,
+            .execution_budget = 1,
+            .io_budget = 1,
+            .preallocate_stack_slab = false,
+        });
+        defer rt.deinit();
+
+        var completed: usize = 0;
+        var observed_sum: usize = 0;
+        const collector = try rt.spawn(Collector{
+            .expected = MessageCount,
+            .count = &completed,
+            .sum = &observed_sum,
+        });
+
+        var workers: [WorkerCount]Actor(WorkerMsg) = undefined;
+        for (&workers) |*worker_handle| {
+            worker_handle.* = try rt.spawn(WorkerActor{});
+        }
+
+        var prng = std.Random.DefaultPrng.init(seed);
+        const random = prng.random();
+        var expected_sum: usize = 0;
+        for (0..MessageCount) |value| {
+            const target = random.uintLessThan(usize, WorkerCount);
+            expected_sum += value;
+            try workers[target].send(.{ .task = .{
+                .value = value,
+                .reply_to = collector,
+            } });
+        }
+        for (workers) |worker_handle| try worker_handle.send(.stop);
+
+        try rt.run();
+
+        try testing.expectEqual(@as(usize, MessageCount), completed);
+        try testing.expectEqual(expected_sum, observed_sum);
+    }
+}
+
 fn nextTarget(seed: u64, current: usize, origin: usize, remaining: usize) usize {
     const mixed = seed ^ (@as(u64, @intCast(current)) *% 0x9e37_79b9) ^ (@as(u64, @intCast(origin)) *% 0x85eb_ca6b) ^ @as(u64, @intCast(remaining));
     return @intCast(mixed % 8);
