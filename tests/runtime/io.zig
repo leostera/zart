@@ -692,7 +692,7 @@ test "posix io driver reads files through ctx io" {
     defer file.close(testing.io);
     try file.writeStreamingAll(testing.io, "hello");
 
-    var posix_io = DefaultIo.init();
+    var posix_io = try DefaultIo.init();
     defer posix_io.deinit();
 
     var rt = try Runtime.init(testing.allocator, .{ .worker_count = 1, .io = posix_io.driver() });
@@ -731,7 +731,7 @@ test "posix io driver writes files through ctx io" {
     var file = try tmp.dir.createFile(testing.io, "output.txt", .{ .read = true });
     defer file.close(testing.io);
 
-    var posix_io = DefaultIo.init();
+    var posix_io = try DefaultIo.init();
     defer posix_io.deinit();
 
     var rt = try Runtime.init(testing.allocator, .{ .worker_count = 1, .io = posix_io.driver() });
@@ -806,7 +806,7 @@ test "posix io driver parks socket reads until another actor writes" {
         };
     };
 
-    var posix_io = DefaultIo.init();
+    var posix_io = try DefaultIo.init();
     defer posix_io.deinit();
 
     var rt = try Runtime.init(testing.allocator, .{ .worker_count = 1, .io = posix_io.driver() });
@@ -904,7 +904,7 @@ test "posix io driver parks socket writes until peer reads" {
         };
     };
 
-    var posix_io = DefaultIo.init();
+    var posix_io = try DefaultIo.init();
     defer posix_io.deinit();
 
     var rt = try Runtime.init(testing.allocator, .{ .worker_count = 1, .io = posix_io.driver() });
@@ -932,6 +932,104 @@ test "posix io driver parks socket writes until peer reads" {
     try testing.expect(writer_done);
     try testing.expect(saw_marker);
     try testing.expectEqual(filled + 1, read_bytes);
+}
+
+test "posix io driver wakes blocked poller when a new request is submitted" {
+    const testing = std.testing;
+
+    if (!@hasDecl(std.posix.system, "socketpair")) return error.SkipZigTest;
+
+    var parked_pair: [2]std.posix.fd_t = undefined;
+    switch (std.posix.errno(std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &parked_pair))) {
+        .SUCCESS => {},
+        else => return error.SkipZigTest,
+    }
+    defer closeFd(parked_pair[0]);
+    defer closeFd(parked_pair[1]);
+    try setNonblocking(parked_pair[0]);
+    try setNonblocking(parked_pair[1]);
+
+    var woken_pair: [2]std.posix.fd_t = undefined;
+    switch (std.posix.errno(std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &woken_pair))) {
+        .SUCCESS => {},
+        else => return error.SkipZigTest,
+    }
+    defer closeFd(woken_pair[0]);
+    defer closeFd(woken_pair[1]);
+    try setNonblocking(woken_pair[0]);
+    try setNonblocking(woken_pair[1]);
+
+    const Completion = struct {
+        fn complete(context: ?*anyopaque, request: *IoRequest) void {
+            const count: *std.atomic.Value(usize) = @ptrCast(@alignCast(context.?));
+            request.completed.store(true, .release);
+            _ = count.fetchAdd(1, .acq_rel);
+        }
+    };
+
+    var completion_count: std.atomic.Value(usize) = .init(0);
+    var parked_actor: u8 = 0;
+    var parked_buffer: [1]u8 = undefined;
+    var parked_data = [_][]u8{parked_buffer[0..]};
+    var parked_request = IoRequest.initNetRead(&parked_actor, parked_pair[0], parked_data[0..]);
+    parked_request.complete_context = &completion_count;
+    parked_request.complete_fn = Completion.complete;
+
+    var woken_actor: u8 = 0;
+    var woken_buffer: [1]u8 = undefined;
+    var woken_data = [_][]u8{woken_buffer[0..]};
+    var woken_request = IoRequest.initNetRead(&woken_actor, woken_pair[0], woken_data[0..]);
+    woken_request.complete_context = &completion_count;
+    woken_request.complete_fn = Completion.complete;
+
+    var posix_io = try DefaultIo.init();
+    defer posix_io.deinit();
+
+    var driver = posix_io.driver();
+    driver.submit(&parked_request);
+    try testing.expect(!parked_request.completed.load(.acquire));
+
+    const Poller = struct {
+        io: *DefaultIo,
+        done: std.atomic.Value(bool) = .init(false),
+        failed: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            var local_driver = self.io.driver();
+            local_driver.poll(.wait) catch {
+                self.failed.store(true, .release);
+            };
+            self.done.store(true, .release);
+        }
+    };
+
+    var poller = Poller{ .io = &posix_io };
+    const poll_thread = try std.Thread.spawn(.{}, Poller.run, .{&poller});
+    sleepMs(10);
+
+    driver.submit(&woken_request);
+    try writeByte(woken_pair[1], 'w');
+
+    var timed_out = false;
+    var waited_ms: usize = 0;
+    while (!poller.done.load(.acquire) and waited_ms < 500) : (waited_ms += 1) {
+        sleepMs(1);
+    }
+    if (!poller.done.load(.acquire)) {
+        timed_out = true;
+        try writeByte(parked_pair[1], 'p');
+    }
+
+    poll_thread.join();
+    try testing.expect(!poller.failed.load(.acquire));
+    try testing.expect(!timed_out);
+    try testing.expect(woken_request.completed.load(.acquire));
+    try testing.expect(!parked_request.completed.load(.acquire));
+
+    try writeByte(parked_pair[1], 'p');
+    try driver.poll(.nonblocking);
+    try testing.expect(parked_request.completed.load(.acquire));
+    try testing.expectEqual(@as(usize, 2), completion_count.load(.acquire));
 }
 
 fn streamFromFd(fd: std.posix.fd_t) std.Io.net.Stream {
@@ -964,6 +1062,35 @@ fn fillSocketUntilWouldBlock(fd: std.posix.fd_t) !usize {
     }
 
     return error.SkipZigTest;
+}
+
+fn writeByte(fd: std.posix.fd_t, byte: u8) !void {
+    var buffer: [1]u8 = .{byte};
+    while (true) {
+        const rc = std.posix.system.write(fd, &buffer, buffer.len);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => {
+                if (rc != 1) return error.Unexpected;
+                return;
+            },
+            .INTR, .AGAIN => continue,
+            else => return error.SkipZigTest,
+        }
+    }
+}
+
+fn sleepMs(milliseconds: u64) void {
+    var remaining: std.posix.timespec = .{
+        .sec = @intCast(milliseconds / 1000),
+        .nsec = @intCast((milliseconds % 1000) * std.time.ns_per_ms),
+    };
+    while (true) {
+        switch (std.posix.errno(std.posix.system.nanosleep(&remaining, &remaining))) {
+            .SUCCESS => return,
+            .INTR => continue,
+            else => return,
+        }
+    }
 }
 
 fn closeFd(fd: std.posix.fd_t) void {

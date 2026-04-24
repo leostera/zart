@@ -22,15 +22,23 @@ pub const Posix = struct {
     mutex: std.Io.Mutex = .init,
     pending_head: ?*RuntimeIo.Request = null,
     pending_tail: ?*RuntimeIo.Request = null,
+    wake_read: posix.fd_t,
+    wake_write: posix.fd_t,
 
     const Self = @This();
 
-    pub fn init() Self {
-        return .{};
+    pub fn init() !Self {
+        const wake_pipe = try createWakePipe();
+        return .{
+            .wake_read = wake_pipe[0],
+            .wake_write = wake_pipe[1],
+        };
     }
 
     pub fn deinit(self: *Self) void {
         std.debug.assert(self.pending_head == null);
+        closeFd(self.wake_read);
+        closeFd(self.wake_write);
         self.* = undefined;
     }
 
@@ -47,8 +55,9 @@ pub const Posix = struct {
         if (self.tryComplete(request)) return;
 
         self.mutex.lockUncancelable(std.Options.debug_io);
-        defer self.mutex.unlock(std.Options.debug_io);
         self.enqueue(request);
+        self.mutex.unlock(std.Options.debug_io);
+        self.wakePoller();
     }
 
     fn poll(context: ?*anyopaque, mode: RuntimeIo.PollMode) !void {
@@ -59,22 +68,21 @@ pub const Posix = struct {
             self.mutex.lockUncancelable(std.Options.debug_io);
             const pollfds = self.fillPollfds(&pollfds_buffer);
             self.mutex.unlock(std.Options.debug_io);
-            if (pollfds.len == 0) return;
+            if (pollfds.len <= 1) return;
 
             const timeout: i32 = switch (mode) {
                 .nonblocking => 0,
-                // TODO: replace this bounded wait with a poller wake fd so
-                // cross-worker submits can interrupt a sleeping poll call.
-                .wait => 1,
+                .wait => -1,
             };
             const ready = try posix.poll(pollfds, timeout);
             if (ready == 0) return;
+            if (pollfds[0].revents != 0) self.drainWakePipe();
 
             self.mutex.lockUncancelable(std.Options.debug_io);
-            self.retryReady(pollfds);
+            const completed_any = self.retryReady(pollfds[1..]);
             const empty = self.pending_head == null;
             self.mutex.unlock(std.Options.debug_io);
-            if (mode == .nonblocking or empty) return;
+            if (mode == .nonblocking or completed_any or empty) return;
         }
     }
 
@@ -89,7 +97,15 @@ pub const Posix = struct {
     }
 
     fn fillPollfds(self: *Self, buffer: []posix.pollfd) []posix.pollfd {
-        var count: usize = 0;
+        std.debug.assert(buffer.len != 0);
+
+        var count: usize = 1;
+        buffer[0] = .{
+            .fd = self.wake_read,
+            .events = pollEvents(.read),
+            .revents = 0,
+        };
+
         var node = self.pending_head;
         while (node) |request| : (node = request.next) {
             if (count == buffer.len) break;
@@ -103,10 +119,11 @@ pub const Posix = struct {
         return buffer[0..count];
     }
 
-    fn retryReady(self: *Self, pollfds: []const posix.pollfd) void {
+    fn retryReady(self: *Self, pollfds: []const posix.pollfd) bool {
         var previous: ?*RuntimeIo.Request = null;
         var current = self.pending_head;
         var index: usize = 0;
+        var completed_any = false;
 
         while (current) |request| {
             const next = request.next;
@@ -124,11 +141,39 @@ pub const Posix = struct {
                 }
                 if (self.pending_tail == request) self.pending_tail = previous;
                 request.next = null;
+                completed_any = true;
             } else {
                 previous = request;
             }
 
             current = next;
+        }
+
+        return completed_any;
+    }
+
+    fn wakePoller(self: *Self) void {
+        var byte: [1]u8 = .{1};
+        while (true) {
+            const rc = posix.system.write(self.wake_write, &byte, byte.len);
+            switch (posix.errno(rc)) {
+                .SUCCESS, .AGAIN => return,
+                .INTR => continue,
+                else => return,
+            }
+        }
+    }
+
+    fn drainWakePipe(self: *Self) void {
+        var buffer: [64]u8 = undefined;
+        while (true) {
+            const rc = posix.system.read(self.wake_read, &buffer, buffer.len);
+            switch (posix.errno(rc)) {
+                .SUCCESS => if (rc == 0) return,
+                .AGAIN => return,
+                .INTR => continue,
+                else => return,
+            }
         }
     }
 
@@ -233,6 +278,47 @@ pub const Posix = struct {
         }
     }
 };
+
+fn createWakePipe() ![2]posix.fd_t {
+    var fds: [2]posix.fd_t = undefined;
+    switch (posix.errno(posix.system.pipe(&fds))) {
+        .SUCCESS => {},
+        .NFILE => return error.SystemFdQuotaExceeded,
+        .MFILE => return error.ProcessFdQuotaExceeded,
+        else => |err| return posix.unexpectedErrno(err),
+    }
+    errdefer {
+        closeFd(fds[0]);
+        closeFd(fds[1]);
+    }
+
+    try setNonblocking(fds[0]);
+    try setNonblocking(fds[1]);
+    return fds;
+}
+
+fn setNonblocking(fd: posix.fd_t) !void {
+    var flags: usize = while (true) {
+        const rc = posix.system.fcntl(fd, posix.F.GETFL, @as(usize, 0));
+        switch (posix.errno(rc)) {
+            .SUCCESS => break @intCast(rc),
+            .INTR => continue,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    };
+    flags |= @as(usize, 1 << @bitOffsetOf(posix.O, "NONBLOCK"));
+    while (true) {
+        switch (posix.errno(posix.system.fcntl(fd, posix.F.SETFL, flags))) {
+            .SUCCESS => return,
+            .INTR => continue,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    }
+}
+
+fn closeFd(fd: posix.fd_t) void {
+    _ = posix.system.close(fd);
+}
 
 fn fdOf(request: *const RuntimeIo.Request) posix.fd_t {
     return switch (request.payload) {

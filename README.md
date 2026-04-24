@@ -142,7 +142,7 @@ The driver must not block the scheduler. It can complete requests immediately or
 The default backend is selected at comptime through `zart.io.Default`:
 
 ```zig
-var actor_io = zart.io.Default.init();
+var actor_io = try zart.io.Default.init();
 defer actor_io.deinit();
 
 var rt = try zart.Runtime.init(allocator, .{

@@ -888,7 +888,7 @@ fn measureFileRead(reporter: Reporter, options: Options, operation_count: usize)
     @memset(&contents, 'z');
     try file.writeStreamingAll(reporter.io, &contents);
 
-    var driver = zart.io.Default.init();
+    var driver = try zart.io.Default.init();
     defer driver.deinit();
 
     var rt = try zart.Runtime.init(std.heap.page_allocator, .{
@@ -934,7 +934,7 @@ fn measureSocketReadWrite(reporter: Reporter, options: Options, byte_count: usiz
     defer std.heap.page_allocator.free(read_data);
     @memset(write_data, 'n');
 
-    var driver = zart.io.Default.init();
+    var driver = try zart.io.Default.init();
     defer driver.deinit();
 
     var rt = try zart.Runtime.init(std.heap.page_allocator, .{
@@ -1045,7 +1045,7 @@ fn measureActorSocketThroughput(reporter: Reporter, options: Options, case: Sock
     defer std.heap.page_allocator.free(read_buffer);
     @memset(write_chunk, 't');
 
-    var driver = zart.io.Default.init();
+    var driver = try zart.io.Default.init();
     defer driver.deinit();
 
     var rt = try zart.Runtime.init(std.heap.page_allocator, .{

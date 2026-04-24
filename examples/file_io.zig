@@ -47,7 +47,7 @@ pub fn main(init: std.process.Init) !void {
     defer file.close(init.io);
     try file.writeStreamingAll(init.io, "hello from zart actors\n");
 
-    var actor_io = zart.io.Default.init();
+    var actor_io = try zart.io.Default.init();
     defer actor_io.deinit();
 
     var rt = try zart.Runtime.init(std.heap.page_allocator, .{
