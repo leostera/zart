@@ -192,11 +192,17 @@ pub const Runtime = struct {
 
     /// Runs runnable actors until no runnable actor remains or an actor fails.
     pub fn run(rt: *Runtime) !void {
+        try rt.runWorker(0);
+    }
+
+    fn runWorker(rt: *Runtime, worker_index: usize) !void {
+        const current_worker = &rt.workers[worker_index];
+
         while (true) {
             try rt.pollIo(.nonblocking);
             rt.drainIoCompletions();
 
-            const ready = rt.dequeue() orelse {
+            const ready = rt.dequeue(current_worker) orelse {
                 if (rt.io.hasPoller() and rt.io.hasPending()) {
                     try rt.pollIo(.wait);
                     rt.drainIoCompletions();
@@ -212,7 +218,6 @@ pub const Runtime = struct {
             ready.budget_remaining = rt.executionBudget();
             ready.io_budget_remaining = rt.ioBudget();
             rt.traceActorResumed(ready.id);
-            const current_worker = rt.primaryWorker();
             current_worker.setCurrent(ready);
             current_actor_header = ready;
             const status = ready.fiber.run() catch |err| {
@@ -309,10 +314,6 @@ pub const Runtime = struct {
         }
     }
 
-    fn primaryWorker(rt: *Runtime) *Worker {
-        return &rt.workers[0];
-    }
-
     fn ownerWorker(rt: *Runtime, target: *const ActorHeader) *Worker {
         return &rt.workers[target.owner_worker];
     }
@@ -374,8 +375,8 @@ pub const Runtime = struct {
         owner.injectAndNotify(rt.options.scheduler_io, target);
     }
 
-    fn dequeue(rt: *Runtime) ?*ActorHeader {
-        return rt.primaryWorker().dequeue();
+    fn dequeue(_: *Runtime, target_worker: *Worker) ?*ActorHeader {
+        return target_worker.dequeue();
     }
 
     fn destroyActor(rt: *Runtime, target: *ActorHeader) void {
