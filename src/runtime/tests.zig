@@ -49,7 +49,7 @@ test "function actor counter" {
         };
     };
 
-    var rt = Runtime.init(testing.allocator, .{});
+    var rt = try Runtime.init(testing.allocator, .{});
     defer rt.deinit();
 
     var observed: u64 = 0;
@@ -111,7 +111,7 @@ test "struct actor counter" {
         };
     };
 
-    var rt = Runtime.init(testing.allocator, .{});
+    var rt = try Runtime.init(testing.allocator, .{});
     defer rt.deinit();
 
     var observed: u64 = 0;
@@ -185,7 +185,7 @@ test "yield lets another runnable actor run" {
         };
     };
 
-    var rt = Runtime.init(testing.allocator, .{ .execution_budget = 1 });
+    var rt = try Runtime.init(testing.allocator, .{ .execution_budget = 1 });
     defer rt.deinit();
 
     var timeline: Trace = .{};
@@ -256,7 +256,7 @@ test "execution budget controls yield switching" {
         };
     };
 
-    var rt = Runtime.init(testing.allocator, .{ .execution_budget = 2 });
+    var rt = try Runtime.init(testing.allocator, .{ .execution_budget = 2 });
     defer rt.deinit();
 
     var timeline: Trace = .{};
@@ -321,7 +321,7 @@ test "actor can spawn child actor" {
         };
     };
 
-    var rt = Runtime.init(testing.allocator, .{});
+    var rt = try Runtime.init(testing.allocator, .{});
     defer rt.deinit();
 
     var observed: u64 = 0;
@@ -388,7 +388,7 @@ test "ctx io preserves std Io signature and delegates to runtime io" {
     };
 
     var fake_io: FakeIo = .{};
-    var rt = Runtime.init(testing.allocator, .{ .io = fake_io.interface() });
+    var rt = try Runtime.init(testing.allocator, .{ .io = fake_io.interface() });
     defer rt.deinit();
 
     var observed: u8 = 0;
@@ -486,7 +486,7 @@ test "std Io calls consume io budget and yield cooperatively" {
     };
 
     var fake_io: FakeIo = .{};
-    var rt = Runtime.init(testing.allocator, .{
+    var rt = try Runtime.init(testing.allocator, .{
         .io = fake_io.interface(),
         .io_budget = 1,
     });
@@ -502,6 +502,122 @@ test "std Io calls consume io budget and yield cooperatively" {
 
     try testing.expectEqualStrings("axbc", trace.slice());
     try testing.expectEqual(@as(usize, 2), fake_io.random_calls);
+}
+
+test "std Io operate parks actor until worker completion" {
+    const testing = std.testing;
+
+    const FakeIo = struct {
+        operate_calls: std.atomic.Value(usize) = .init(0),
+
+        const Self = @This();
+
+        const vtable: std.Io.VTable = blk: {
+            var table = std.Io.failing.vtable.*;
+            table.operate = operate;
+            break :blk table;
+        };
+
+        fn interface(self: *Self) std.Io {
+            return .{
+                .userdata = self,
+                .vtable = &vtable,
+            };
+        }
+
+        fn operate(context: ?*anyopaque, operation: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
+            const self: *Self = @ptrCast(@alignCast(context.?));
+            _ = self.operate_calls.fetchAdd(1, .monotonic);
+            return switch (operation) {
+                .file_read_streaming => .{ .file_read_streaming = 7 },
+                else => unreachable,
+            };
+        }
+    };
+
+    const Trace = struct {
+        items: [8]u8 = undefined,
+        len: usize = 0,
+
+        fn push(self: *@This(), item: u8) void {
+            self.items[self.len] = item;
+            self.len += 1;
+        }
+
+        fn slice(self: *const @This()) []const u8 {
+            return self.items[0..self.len];
+        }
+    };
+
+    const WorkerMsg = union(enum) {
+        start,
+    };
+
+    const OtherMsg = union(enum) {
+        hit,
+    };
+
+    const Actors = struct {
+        const Worker = struct {
+            pub const Msg = WorkerMsg;
+
+            trace: *Trace,
+
+            pub fn run(self: *@This(), ctx: *Ctx(Msg)) !void {
+                switch (try ctx.recv()) {
+                    .start => {
+                        var buffer: [1]u8 = undefined;
+                        var buffers = [_][]u8{buffer[0..]};
+
+                        self.trace.push('a');
+                        const result = try std.Io.operate(ctx.io(), .{
+                            .file_read_streaming = .{
+                                .file = .stdin(),
+                                .data = &buffers,
+                            },
+                        });
+                        switch (result) {
+                            .file_read_streaming => |read_result| {
+                                try testing.expectEqual(@as(usize, 7), try read_result);
+                            },
+                            else => unreachable,
+                        }
+                        self.trace.push('c');
+                    },
+                }
+            }
+        };
+
+        const Other = struct {
+            pub const Msg = OtherMsg;
+
+            trace: *Trace,
+
+            pub fn run(self: *@This(), ctx: *Ctx(Msg)) !void {
+                switch (try ctx.recv()) {
+                    .hit => self.trace.push('b'),
+                }
+            }
+        };
+    };
+
+    var fake_io: FakeIo = .{};
+    var rt = try Runtime.init(testing.allocator, .{
+        .io = fake_io.interface(),
+        .io_poll_interval_ns = 1,
+    });
+    defer rt.deinit();
+
+    var trace: Trace = .{};
+    const worker = try rt.spawn(Actors.Worker{ .trace = &trace });
+    const other = try rt.spawn(Actors.Other{ .trace = &trace });
+
+    try worker.send(.start);
+    try other.send(.hit);
+    try rt.run();
+
+    try testing.expectEqualStrings("abc", trace.slice());
+    try testing.expectEqual(@as(usize, 1), fake_io.operate_calls.load(.monotonic));
 }
 
 test "run parks waiting actors until later sends wake them" {
@@ -531,7 +647,7 @@ test "run parks waiting actors until later sends wake them" {
         }
     };
 
-    var rt = Runtime.init(testing.allocator, .{});
+    var rt = try Runtime.init(testing.allocator, .{});
     defer rt.deinit();
 
     var items: [4]u8 = undefined;
@@ -583,7 +699,7 @@ test "messages to one actor are received in FIFO order" {
         }
     };
 
-    var rt = Runtime.init(testing.allocator, .{});
+    var rt = try Runtime.init(testing.allocator, .{});
     defer rt.deinit();
 
     var observed: [64]u16 = undefined;
@@ -639,7 +755,7 @@ test "actor self handle can enqueue messages to itself" {
         }
     };
 
-    var rt = Runtime.init(testing.allocator, .{ .execution_budget = 1 });
+    var rt = try Runtime.init(testing.allocator, .{ .execution_budget = 1 });
     defer rt.deinit();
 
     var observed: [8]u8 = undefined;
@@ -676,7 +792,7 @@ test "raw send rejects wrong message type" {
         }
     };
 
-    var rt = Runtime.init(testing.allocator, .{});
+    var rt = try Runtime.init(testing.allocator, .{});
     defer rt.deinit();
 
     const stopped = try rt.spawn(StopActor{});
@@ -703,7 +819,7 @@ test "actor failure destroys actor and invalidates handle" {
         }
     };
 
-    var rt = Runtime.init(testing.allocator, .{});
+    var rt = try Runtime.init(testing.allocator, .{});
     defer rt.deinit();
 
     const failing = try rt.spawn(FailingActor{});
@@ -741,7 +857,7 @@ test "message sends structurally copy values but preserve references" {
         }
     };
 
-    var rt = Runtime.init(testing.allocator, .{});
+    var rt = try Runtime.init(testing.allocator, .{});
     defer rt.deinit();
 
     var referenced: u64 = 1;
@@ -821,7 +937,7 @@ test "tracer records actor-originated sends" {
     };
 
     var recorder: Recorder = .{};
-    var rt = Runtime.init(testing.allocator, .{ .tracer = recorder.tracer() });
+    var rt = try Runtime.init(testing.allocator, .{ .tracer = recorder.tracer() });
     defer rt.deinit();
 
     var seen = false;
@@ -887,7 +1003,7 @@ test "tracer records actor failures" {
     };
 
     var recorder: Recorder = .{};
-    var rt = Runtime.init(testing.allocator, .{ .tracer = recorder.tracer() });
+    var rt = try Runtime.init(testing.allocator, .{ .tracer = recorder.tracer() });
     defer rt.deinit();
 
     const failing = try rt.spawn(FailingActor{});
@@ -997,7 +1113,7 @@ test "randomized counter command streams match a reference model" {
             }
         }
 
-        var rt = Runtime.init(testing.allocator, .{
+        var rt = try Runtime.init(testing.allocator, .{
             .execution_budget = @as(usize, @intCast(seed % 4 + 1)),
         });
         defer rt.deinit();
@@ -1041,7 +1157,7 @@ test "completed actors release their registry slot" {
         }
     };
 
-    var rt = Runtime.init(testing.allocator, .{});
+    var rt = try Runtime.init(testing.allocator, .{});
     defer rt.deinit();
 
     const first = try rt.spawn(StopActor{});
@@ -1075,7 +1191,7 @@ test "failed spawn releases reserved actor id" {
         }
     };
 
-    var rt = Runtime.init(testing.allocator, .{ .stack_size = 1 });
+    var rt = try Runtime.init(testing.allocator, .{ .stack_size = 1 });
     defer rt.deinit();
 
     try testing.expectError(error.StackTooSmall, rt.spawn(StopActor{}));
@@ -1124,7 +1240,7 @@ test "tracer records runtime events" {
     };
 
     var recorder: Recorder = .{};
-    var rt = Runtime.init(testing.allocator, .{ .tracer = recorder.tracer() });
+    var rt = try Runtime.init(testing.allocator, .{ .tracer = recorder.tracer() });
     defer rt.deinit();
 
     const stopped = try rt.spawn(StopActor{});

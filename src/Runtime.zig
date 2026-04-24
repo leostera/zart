@@ -31,6 +31,7 @@ const ActorState = enum {
 const WaitReason = union(enum) {
     none,
     recv,
+    io,
 };
 
 const ActorHeader = struct {
@@ -66,6 +67,10 @@ pub const Runtime = struct {
         execution_budget: usize = 64,
         /// Number of completed I/O boundaries an actor may pass per scheduler turn.
         io_budget: usize = 64,
+        /// Enables the runtime-owned I/O worker when a base `std.Io` is provided.
+        io_thread: bool = true,
+        /// Poll interval for the first worker-backed I/O driver.
+        io_poll_interval_ns: u64 = 100_000,
         /// Allocator used for actor cells, fiber stacks, registry slots, and inbox nodes.
         internal_allocator: ?Allocator = null,
         /// Optional runtime event sink. `null` avoids constructing trace events.
@@ -84,13 +89,13 @@ pub const Runtime = struct {
     current_actor: ?*ActorHeader,
 
     /// Creates a runtime. `allocator` is exposed to actors through `ctx.allocator()`.
-    pub fn init(allocator: Allocator, options: Options) Runtime {
+    pub fn init(allocator: Allocator, options: Options) RuntimeIo.InitError!Runtime {
         const internal_allocator = options.internal_allocator orelse std.heap.smp_allocator;
         return .{
             .allocator = allocator,
             .internal_allocator = internal_allocator,
             .options = options,
-            .io = .init(options.io),
+            .io = try .init(internal_allocator, options.io, options.io_thread, options.io_poll_interval_ns),
             .actors = .{},
             .run_head = null,
             .run_tail = null,
@@ -101,7 +106,7 @@ pub const Runtime = struct {
     /// Destroys all live actors and runtime-owned internal storage.
     pub fn deinit(rt: *Runtime) void {
         rt.actors.deinit(rt.internal_allocator, rt);
-        rt.io.deinit();
+        rt.io.deinit(rt.internal_allocator);
         rt.* = undefined;
     }
 
@@ -130,7 +135,15 @@ pub const Runtime = struct {
 
     /// Runs runnable actors until no runnable actor remains or an actor fails.
     pub fn run(rt: *Runtime) !void {
-        while (rt.dequeue()) |ready| {
+        while (true) {
+            rt.drainIoCompletions();
+
+            const ready = rt.dequeue() orelse {
+                if (!rt.io.hasPending()) return;
+                rt.io.waitForCompletion();
+                continue;
+            };
+
             if (ready.state != .runnable) continue;
 
             ready.state = .running;
@@ -230,7 +243,7 @@ pub const Runtime = struct {
                         target.state = .runnable;
                         rt.enqueue(target);
                     },
-                    .none => {},
+                    .io, .none => {},
                 }
             },
             .runnable, .running => {},
@@ -263,6 +276,23 @@ pub const Runtime = struct {
 
     fn destroyActor(rt: *Runtime, target: *ActorHeader) void {
         rt.actors.destroy(rt, target);
+    }
+
+    fn drainIoCompletions(rt: *Runtime) void {
+        while (rt.io.popCompletion()) |request| {
+            const target: *ActorHeader = @ptrCast(@alignCast(request.actor));
+            switch (target.state) {
+                .waiting => switch (target.wait_reason) {
+                    .io => {
+                        target.wait_reason = .none;
+                        target.state = .runnable;
+                        rt.enqueue(target);
+                    },
+                    .recv, .none => {},
+                },
+                .runnable, .running, .completed, .failed => {},
+            }
+        }
     }
 
     fn executionBudget(rt: *const Runtime) usize {
@@ -333,6 +363,15 @@ fn chargeActorIo(runtime: *anyopaque, actor_header: *anyopaque) void {
     const rt: *Runtime = @ptrCast(@alignCast(runtime));
     const target: *ActorHeader = @ptrCast(@alignCast(actor_header));
     rt.chargeIoBoundary(target);
+}
+
+fn parkActorIo(runtime: *anyopaque, actor_header: *anyopaque) void {
+    const rt: *Runtime = @ptrCast(@alignCast(runtime));
+    const target: *ActorHeader = @ptrCast(@alignCast(actor_header));
+    rt.traceActorWaiting(target.id);
+    target.state = .waiting;
+    target.wait_reason = .io;
+    Fiber.yield();
 }
 
 /// Typed actor handle. This is the user-facing capability used for sends.
@@ -444,7 +483,7 @@ fn FunctionActorCell(comptime Msg: type, comptime entry: anytype) type {
                     .raw = cell.header.id,
                     .runtime = cell.header.runtime,
                 },
-                .io_context = .init(&cell.header.runtime.io.base, cell.header.runtime, &cell.header, chargeActorIo),
+                .io_context = .init(&cell.header.runtime.io, cell.header.runtime, &cell.header, chargeActorIo, parkActorIo),
             };
             try entry(&ctx);
         }
@@ -505,7 +544,7 @@ fn StructActorCell(comptime Msg: type, comptime ActorType: type) type {
                     .raw = cell.header.id,
                     .runtime = cell.header.runtime,
                 },
-                .io_context = .init(&cell.header.runtime.io.base, cell.header.runtime, &cell.header, chargeActorIo),
+                .io_context = .init(&cell.header.runtime.io, cell.header.runtime, &cell.header, chargeActorIo, parkActorIo),
             };
             try cell.actor.run(&ctx);
         }

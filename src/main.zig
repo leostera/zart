@@ -38,7 +38,7 @@ fn printReply(ctx: *zart.Ctx(Reply)) !void {
 pub fn main(init: std.process.Init) !void {
     _ = init;
 
-    var rt = zart.Runtime.init(std.heap.page_allocator, .{});
+    var rt = try zart.Runtime.init(std.heap.page_allocator, .{});
     defer rt.deinit();
 
     const replies = try rt.spawn(printReply);
