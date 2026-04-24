@@ -6,6 +6,8 @@ const runtime = @import("../Runtime.zig");
 const Actor = runtime.Actor;
 const ActorId = runtime.ActorId;
 const Ctx = runtime.Ctx;
+const IoDriver = runtime.IoDriver;
+const IoRequest = runtime.IoRequest;
 const Runtime = runtime.Runtime;
 const TraceEvent = runtime.TraceEvent;
 const Tracer = runtime.Tracer;
@@ -337,29 +339,22 @@ test "actor can spawn child actor" {
 test "ctx io preserves std Io signature and delegates to runtime io" {
     const testing = std.testing;
 
-    const FakeIo = struct {
-        random_calls: usize = 0,
-        byte: u8 = 0xa5,
+    const FakeDriver = struct {
+        operate_calls: usize = 0,
 
         const Self = @This();
 
-        const vtable: std.Io.VTable = blk: {
-            var table = std.Io.failing.vtable.*;
-            table.random = random;
-            break :blk table;
-        };
-
-        fn interface(self: *Self) std.Io {
+        fn driver(self: *Self) IoDriver {
             return .{
-                .userdata = self,
-                .vtable = &vtable,
+                .context = self,
+                .submit_fn = submit,
             };
         }
 
-        fn random(context: ?*anyopaque, buffer: []u8) void {
+        fn submit(context: ?*anyopaque, request: *IoRequest) void {
             const self: *Self = @ptrCast(@alignCast(context.?));
-            @memset(buffer, self.byte);
-            self.random_calls += 1;
+            self.operate_calls += 1;
+            request.completeOperate(.{ .file_read_streaming = 1 });
         }
     };
 
@@ -370,8 +365,17 @@ test "ctx io preserves std Io signature and delegates to runtime io" {
     const Actors = struct {
         fn readOne(io: std.Io, out: *u8) void {
             var buffer: [1]u8 = undefined;
-            std.Io.random(io, &buffer);
-            out.* = buffer[0];
+            var buffers = [_][]u8{buffer[0..]};
+            const result = std.Io.operate(io, .{
+                .file_read_streaming = .{
+                    .file = .stdin(),
+                    .data = &buffers,
+                },
+            }) catch unreachable;
+            switch (result) {
+                .file_read_streaming => |read_result| out.* = @intCast(read_result catch unreachable),
+                else => unreachable,
+            }
         }
 
         const Worker = struct {
@@ -387,8 +391,8 @@ test "ctx io preserves std Io signature and delegates to runtime io" {
         };
     };
 
-    var fake_io: FakeIo = .{};
-    var rt = try Runtime.init(testing.allocator, .{ .io = fake_io.interface() });
+    var fake_driver: FakeDriver = .{};
+    var rt = try Runtime.init(testing.allocator, .{ .io = fake_driver.driver() });
     defer rt.deinit();
 
     var observed: u8 = 0;
@@ -397,37 +401,12 @@ test "ctx io preserves std Io signature and delegates to runtime io" {
     try worker.send(.run);
     try rt.run();
 
-    try testing.expectEqual(@as(u8, 0xa5), observed);
-    try testing.expectEqual(@as(usize, 1), fake_io.random_calls);
+    try testing.expectEqual(@as(u8, 1), observed);
+    try testing.expectEqual(@as(usize, 1), fake_driver.operate_calls);
 }
 
 test "std Io calls consume io budget and yield cooperatively" {
     const testing = std.testing;
-
-    const FakeIo = struct {
-        random_calls: usize = 0,
-
-        const Self = @This();
-
-        const vtable: std.Io.VTable = blk: {
-            var table = std.Io.failing.vtable.*;
-            table.random = random;
-            break :blk table;
-        };
-
-        fn interface(self: *Self) std.Io {
-            return .{
-                .userdata = self,
-                .vtable = &vtable,
-            };
-        }
-
-        fn random(context: ?*anyopaque, buffer: []u8) void {
-            const self: *Self = @ptrCast(@alignCast(context.?));
-            @memset(buffer, @as(u8, @intCast(self.random_calls)));
-            self.random_calls += 1;
-        }
-    };
 
     const Trace = struct {
         items: [8]u8 = undefined,
@@ -485,9 +464,7 @@ test "std Io calls consume io budget and yield cooperatively" {
         };
     };
 
-    var fake_io: FakeIo = .{};
     var rt = try Runtime.init(testing.allocator, .{
-        .io = fake_io.interface(),
         .io_budget = 1,
     });
     defer rt.deinit();
@@ -501,37 +478,27 @@ test "std Io calls consume io budget and yield cooperatively" {
     try rt.run();
 
     try testing.expectEqualStrings("axbc", trace.slice());
-    try testing.expectEqual(@as(usize, 2), fake_io.random_calls);
 }
 
-test "std Io operate parks actor until worker completion" {
+test "std Io operate parks actor until non-blocking driver completion" {
     const testing = std.testing;
 
-    const FakeIo = struct {
-        operate_calls: std.atomic.Value(usize) = .init(0),
+    const FakeDriver = struct {
+        operate_calls: usize = 0,
 
         const Self = @This();
 
-        const vtable: std.Io.VTable = blk: {
-            var table = std.Io.failing.vtable.*;
-            table.operate = operate;
-            break :blk table;
-        };
-
-        fn interface(self: *Self) std.Io {
+        fn driver(self: *Self) IoDriver {
             return .{
-                .userdata = self,
-                .vtable = &vtable,
+                .context = self,
+                .submit_fn = submit,
             };
         }
 
-        fn operate(context: ?*anyopaque, operation: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
+        fn submit(context: ?*anyopaque, request: *IoRequest) void {
             const self: *Self = @ptrCast(@alignCast(context.?));
-            _ = self.operate_calls.fetchAdd(1, .monotonic);
-            return switch (operation) {
-                .file_read_streaming => .{ .file_read_streaming = 7 },
-                else => unreachable,
-            };
+            self.operate_calls += 1;
+            request.completeOperate(.{ .file_read_streaming = 7 });
         }
     };
 
@@ -601,10 +568,9 @@ test "std Io operate parks actor until worker completion" {
         };
     };
 
-    var fake_io: FakeIo = .{};
+    var fake_driver: FakeDriver = .{};
     var rt = try Runtime.init(testing.allocator, .{
-        .io = fake_io.interface(),
-        .io_poll_interval_ns = 1,
+        .io = fake_driver.driver(),
     });
     defer rt.deinit();
 
@@ -617,47 +583,138 @@ test "std Io operate parks actor until worker completion" {
     try rt.run();
 
     try testing.expectEqualStrings("abc", trace.slice());
-    try testing.expectEqual(@as(usize, 1), fake_io.operate_calls.load(.monotonic));
+    try testing.expectEqual(@as(usize, 1), fake_driver.operate_calls);
 }
 
-test "std Io batch waits park actor until worker completion" {
+test "pending non-blocking io can complete after run returns" {
     const testing = std.testing;
 
-    const FakeIo = struct {
-        async_calls: std.atomic.Value(usize) = .init(0),
-        concurrent_calls: std.atomic.Value(usize) = .init(0),
+    const FakeDriver = struct {
+        pending: ?*IoRequest = null,
+        submit_calls: usize = 0,
 
         const Self = @This();
 
-        const vtable: std.Io.VTable = blk: {
-            var table = std.Io.failing.vtable.*;
-            table.batchAwaitAsync = batchAwaitAsync;
-            table.batchAwaitConcurrent = batchAwaitConcurrent;
-            break :blk table;
-        };
-
-        fn interface(self: *Self) std.Io {
+        fn driver(self: *Self) IoDriver {
             return .{
-                .userdata = self,
-                .vtable = &vtable,
+                .context = self,
+                .submit_fn = submit,
             };
         }
 
-        fn batchAwaitAsync(context: ?*anyopaque, batch: *std.Io.Batch) std.Io.Cancelable!void {
+        fn submit(context: ?*anyopaque, request: *IoRequest) void {
             const self: *Self = @ptrCast(@alignCast(context.?));
-            _ = batch;
-            _ = self.async_calls.fetchAdd(1, .monotonic);
+            self.submit_calls += 1;
+            self.pending = request;
         }
 
-        fn batchAwaitConcurrent(
-            context: ?*anyopaque,
-            batch: *std.Io.Batch,
-            timeout: std.Io.Timeout,
-        ) std.Io.Batch.AwaitConcurrentError!void {
+        fn complete(self: *Self, value: usize) void {
+            const request = self.pending orelse unreachable;
+            self.pending = null;
+            request.completeOperate(.{ .file_read_streaming = value });
+        }
+    };
+
+    const Trace = struct {
+        items: [4]u8 = undefined,
+        len: usize = 0,
+
+        fn push(self: *@This(), item: u8) void {
+            self.items[self.len] = item;
+            self.len += 1;
+        }
+
+        fn slice(self: *const @This()) []const u8 {
+            return self.items[0..self.len];
+        }
+    };
+
+    const WorkerMsg = union(enum) {
+        start,
+    };
+
+    const Worker = struct {
+        pub const Msg = WorkerMsg;
+
+        trace: *Trace,
+
+        pub fn run(self: *@This(), ctx: *Ctx(Msg)) !void {
+            switch (try ctx.recv()) {
+                .start => {
+                    var buffer: [1]u8 = undefined;
+                    var buffers = [_][]u8{buffer[0..]};
+
+                    self.trace.push('a');
+                    const result = try std.Io.operate(ctx.io(), .{
+                        .file_read_streaming = .{
+                            .file = .stdin(),
+                            .data = &buffers,
+                        },
+                    });
+                    switch (result) {
+                        .file_read_streaming => |read_result| {
+                            try testing.expectEqual(@as(usize, 3), try read_result);
+                        },
+                        else => unreachable,
+                    }
+                    self.trace.push('b');
+                },
+            }
+        }
+    };
+
+    var fake_driver: FakeDriver = .{};
+    var rt = try Runtime.init(testing.allocator, .{
+        .io = fake_driver.driver(),
+    });
+    defer rt.deinit();
+
+    var trace: Trace = .{};
+    const worker = try rt.spawn(Worker{ .trace = &trace });
+
+    try worker.send(.start);
+    try rt.run();
+
+    try testing.expectEqualStrings("a", trace.slice());
+    try testing.expectEqual(@as(usize, 1), fake_driver.submit_calls);
+    try testing.expect(fake_driver.pending != null);
+
+    fake_driver.complete(3);
+    try rt.run();
+
+    try testing.expectEqualStrings("ab", trace.slice());
+    try testing.expectEqual(@as(?*IoRequest, null), fake_driver.pending);
+}
+
+test "std Io batch waits park actor until non-blocking driver completion" {
+    const testing = std.testing;
+
+    const FakeDriver = struct {
+        async_calls: usize = 0,
+        concurrent_calls: usize = 0,
+
+        const Self = @This();
+
+        fn driver(self: *Self) IoDriver {
+            return .{
+                .context = self,
+                .submit_fn = submit,
+            };
+        }
+
+        fn submit(context: ?*anyopaque, request: *IoRequest) void {
             const self: *Self = @ptrCast(@alignCast(context.?));
-            _ = batch;
-            _ = timeout;
-            _ = self.concurrent_calls.fetchAdd(1, .monotonic);
+            switch (request.payload) {
+                .batch_await_async => {
+                    self.async_calls += 1;
+                    request.completeBatchAwaitAsync({});
+                },
+                .batch_await_concurrent => {
+                    self.concurrent_calls += 1;
+                    request.completeBatchAwaitConcurrent({});
+                },
+                else => unreachable,
+            }
         }
     };
 
@@ -720,10 +777,9 @@ test "std Io batch waits park actor until worker completion" {
         };
     };
 
-    var fake_io: FakeIo = .{};
+    var fake_driver: FakeDriver = .{};
     var rt = try Runtime.init(testing.allocator, .{
-        .io = fake_io.interface(),
-        .io_poll_interval_ns = 1,
+        .io = fake_driver.driver(),
     });
     defer rt.deinit();
 
@@ -736,8 +792,8 @@ test "std Io batch waits park actor until worker completion" {
     try rt.run();
 
     try testing.expectEqualStrings("abcd", trace.slice());
-    try testing.expectEqual(@as(usize, 1), fake_io.async_calls.load(.monotonic));
-    try testing.expectEqual(@as(usize, 1), fake_io.concurrent_calls.load(.monotonic));
+    try testing.expectEqual(@as(usize, 1), fake_driver.async_calls);
+    try testing.expectEqual(@as(usize, 1), fake_driver.concurrent_calls);
 }
 
 test "run parks waiting actors until later sends wake them" {
@@ -1401,27 +1457,19 @@ test "tracer records runtime events" {
 test "tracer records actor io events" {
     const testing = std.testing;
 
-    const FakeIo = struct {
+    const FakeDriver = struct {
         const Self = @This();
 
-        const vtable: std.Io.VTable = blk: {
-            var table = std.Io.failing.vtable.*;
-            table.operate = operate;
-            break :blk table;
-        };
-
-        fn interface(self: *Self) std.Io {
+        fn driver(self: *Self) IoDriver {
             return .{
-                .userdata = self,
-                .vtable = &vtable,
+                .context = self,
+                .submit_fn = submit,
             };
         }
 
-        fn operate(_: ?*anyopaque, operation: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
-            return switch (operation) {
-                .file_read_streaming => .{ .file_read_streaming = 1 },
-                else => unreachable,
-            };
+        fn submit(context: ?*anyopaque, request: *IoRequest) void {
+            _ = context;
+            request.completeOperate(.{ .file_read_streaming = 1 });
         }
     };
 
@@ -1472,11 +1520,10 @@ test "tracer records actor io events" {
         }
     };
 
-    var fake_io: FakeIo = .{};
+    var fake_driver: FakeDriver = .{};
     var recorder: Recorder = .{};
     var rt = try Runtime.init(testing.allocator, .{
-        .io = fake_io.interface(),
-        .io_poll_interval_ns = 1,
+        .io = fake_driver.driver(),
         .tracer = recorder.tracer(),
     });
     defer rt.deinit();

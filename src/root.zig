@@ -11,6 +11,8 @@ pub const TraceEvent = runtime.TraceEvent;
 pub const MessageTrace = runtime.MessageTrace;
 pub const FailureTrace = runtime.FailureTrace;
 pub const Io = runtime.Io;
+pub const IoDriver = runtime.IoDriver;
+pub const IoRequest = runtime.IoRequest;
 pub const Ctx = runtime.Ctx;
 pub const MessageOf = runtime.MessageOf;
 

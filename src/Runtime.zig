@@ -15,6 +15,8 @@ pub const TraceEvent = trace.TraceEvent;
 pub const Tracer = trace.Tracer;
 pub const MessageOf = actor.MessageOf;
 pub const Io = std.Io;
+pub const IoDriver = RuntimeIo.Driver;
+pub const IoRequest = RuntimeIo.Request;
 
 const ActorIoContext = io.ActorIoContext;
 const RuntimeIo = io.RuntimeIo;
@@ -67,16 +69,12 @@ pub const Runtime = struct {
         execution_budget: usize = 64,
         /// Number of completed I/O boundaries an actor may pass per scheduler turn.
         io_budget: usize = 64,
-        /// Enables the runtime-owned I/O worker when a base `std.Io` is provided.
-        io_thread: bool = true,
-        /// Poll interval for the first worker-backed I/O driver.
-        io_poll_interval_ns: u64 = 100_000,
         /// Allocator used for actor cells, fiber stacks, registry slots, and inbox nodes.
         internal_allocator: ?Allocator = null,
         /// Optional runtime event sink. `null` avoids constructing trace events.
         tracer: ?Tracer = null,
-        /// Optional standard I/O interface wrapped by `ctx.io()`.
-        io: ?std.Io = null,
+        /// Optional non-blocking I/O driver used by `ctx.io()`.
+        io: ?IoDriver = null,
     };
 
     allocator: Allocator,
@@ -95,7 +93,7 @@ pub const Runtime = struct {
             .allocator = allocator,
             .internal_allocator = internal_allocator,
             .options = options,
-            .io = try .init(internal_allocator, options.io, options.io_thread, options.io_poll_interval_ns),
+            .io = try .init(internal_allocator, options.io),
             .actors = .{},
             .run_head = null,
             .run_tail = null,
@@ -139,9 +137,7 @@ pub const Runtime = struct {
             rt.drainIoCompletions();
 
             const ready = rt.dequeue() orelse {
-                if (!rt.io.hasPending()) return;
-                rt.io.waitForCompletion();
-                continue;
+                return;
             };
 
             if (ready.state != .runnable) continue;

@@ -5,37 +5,53 @@ const std = @import("std");
 pub const RuntimeIo = struct {
     shared: *Shared,
 
-    pub const InitError = std.mem.Allocator.Error || std.Thread.SpawnError;
+    pub const InitError = std.mem.Allocator.Error;
+
+    /// Non-blocking actor I/O backend.
+    ///
+    /// `submit_fn` must return without blocking the scheduler. It may complete
+    /// the request immediately or retain it and call the matching `complete*`
+    /// method later from a poller/event callback.
+    pub const Driver = struct {
+        context: ?*anyopaque = null,
+        submit_fn: *const fn (?*anyopaque, *Request) void,
+
+        pub fn submit(driver: Driver, request: *Request) void {
+            driver.submit_fn(driver.context, request);
+        }
+    };
 
     pub const Request = struct {
         next: ?*Request = null,
         actor: *anyopaque,
+        complete_context: ?*anyopaque = null,
+        complete_fn: ?*const fn (?*anyopaque, *Request) void = null,
         completed: std.atomic.Value(bool) = .init(false),
         payload: Payload,
 
-        const Payload = union(enum) {
+        pub const Payload = union(enum) {
             operate: Operate,
             batch_await_async: BatchAwaitAsync,
             batch_await_concurrent: BatchAwaitConcurrent,
             sleep: Sleep,
         };
 
-        const Operate = struct {
+        pub const Operate = struct {
             operation: std.Io.Operation,
             result: std.Io.Cancelable!std.Io.Operation.Result = undefined,
         };
 
-        const Sleep = struct {
+        pub const Sleep = struct {
             timeout: std.Io.Timeout,
             result: std.Io.Cancelable!void = undefined,
         };
 
-        const BatchAwaitAsync = struct {
+        pub const BatchAwaitAsync = struct {
             batch: *std.Io.Batch,
             result: std.Io.Cancelable!void = undefined,
         };
 
-        const BatchAwaitConcurrent = struct {
+        pub const BatchAwaitConcurrent = struct {
             batch: *std.Io.Batch,
             timeout: std.Io.Timeout,
             result: std.Io.Batch.AwaitConcurrentError!void = undefined,
@@ -79,19 +95,39 @@ pub const RuntimeIo = struct {
                 },
             };
         }
+
+        pub fn completeOperate(request: *Request, result: std.Io.Cancelable!std.Io.Operation.Result) void {
+            request.payload.operate.result = result;
+            request.complete();
+        }
+
+        pub fn completeSleep(request: *Request, result: std.Io.Cancelable!void) void {
+            request.payload.sleep.result = result;
+            request.complete();
+        }
+
+        pub fn completeBatchAwaitAsync(request: *Request, result: std.Io.Cancelable!void) void {
+            request.payload.batch_await_async.result = result;
+            request.complete();
+        }
+
+        pub fn completeBatchAwaitConcurrent(request: *Request, result: std.Io.Batch.AwaitConcurrentError!void) void {
+            request.payload.batch_await_concurrent.result = result;
+            request.complete();
+        }
+
+        fn complete(request: *Request) void {
+            const complete_fn = request.complete_fn orelse @panic("I/O request has no completion owner");
+            complete_fn(request.complete_context, request);
+        }
     };
 
     const Shared = struct {
-        base: std.Io,
+        driver: ?Driver,
         lock: SpinLock = .{},
-        submissions_head: ?*Request = null,
-        submissions_tail: ?*Request = null,
         completions_head: ?*Request = null,
         completions_tail: ?*Request = null,
-        active_count: usize = 0,
-        stopping: bool = false,
-        poll_interval_ns: u64,
-        worker: ?std.Thread = null,
+        pending_count: usize = 0,
     };
 
     const SpinLock = struct {
@@ -108,69 +144,49 @@ pub const RuntimeIo = struct {
         }
     };
 
-    pub fn init(
-        allocator: std.mem.Allocator,
-        base_io: ?std.Io,
-        use_thread: bool,
-        poll_interval_ns: u64,
-    ) InitError!RuntimeIo {
+    pub fn init(allocator: std.mem.Allocator, driver: ?Driver) InitError!RuntimeIo {
         const shared = try allocator.create(Shared);
         errdefer allocator.destroy(shared);
 
         shared.* = .{
-            .base = base_io orelse std.Io.failing,
-            .poll_interval_ns = poll_interval_ns,
+            .driver = driver,
         };
-
-        if (base_io != null and use_thread) {
-            shared.worker = try std.Thread.spawn(.{}, workerMain, .{shared});
-        }
 
         return .{ .shared = shared };
     }
 
     pub fn deinit(runtime_io: *RuntimeIo, allocator: std.mem.Allocator) void {
         const shared = runtime_io.shared;
-        {
-            shared.lock.lock();
-            defer shared.lock.unlock();
-            shared.stopping = true;
-        }
-
-        if (shared.worker) |worker| worker.join();
-
         discardCompletions(shared);
-        std.debug.assert(shared.active_count == 0);
+        std.debug.assert(shared.pending_count == 0);
         allocator.destroy(shared);
         runtime_io.* = undefined;
     }
 
-    pub fn hasWorker(runtime_io: *const RuntimeIo) bool {
-        return runtime_io.shared.worker != null;
+    pub fn hasDriver(runtime_io: *const RuntimeIo) bool {
+        return runtime_io.shared.driver != null;
     }
 
     pub fn baseIo(runtime_io: *const RuntimeIo) std.Io {
-        return runtime_io.shared.base;
+        _ = runtime_io;
+        return std.Io.failing;
     }
 
     pub fn submit(runtime_io: *RuntimeIo, request: *Request) void {
         const shared = runtime_io.shared;
+        const driver = shared.driver orelse @panic("actor I/O submitted without an I/O driver");
 
-        shared.lock.lock();
-        defer shared.lock.unlock();
-
-        std.debug.assert(shared.worker != null);
-        std.debug.assert(!shared.stopping);
-
-        request.next = null;
-        request.completed.store(false, .monotonic);
-        if (shared.submissions_tail) |tail| {
-            tail.next = request;
-        } else {
-            shared.submissions_head = request;
+        {
+            shared.lock.lock();
+            defer shared.lock.unlock();
+            shared.pending_count += 1;
         }
-        shared.submissions_tail = request;
-        shared.active_count += 1;
+        request.next = null;
+        request.complete_context = shared;
+        request.complete_fn = completeRequest;
+        request.completed.store(false, .monotonic);
+
+        driver.submit(request);
     }
 
     pub fn popCompletion(runtime_io: *RuntimeIo) ?*Request {
@@ -183,7 +199,7 @@ pub const RuntimeIo = struct {
         shared.completions_head = request.next;
         if (shared.completions_head == null) shared.completions_tail = null;
         request.next = null;
-        shared.active_count -= 1;
+        shared.pending_count -= 1;
         return request;
     }
 
@@ -193,34 +209,11 @@ pub const RuntimeIo = struct {
         shared.lock.lock();
         defer shared.lock.unlock();
 
-        return shared.active_count != 0;
+        return shared.pending_count != 0;
     }
 
-    pub fn waitForCompletion(runtime_io: *RuntimeIo) void {
-        const shared = runtime_io.shared;
-
-        while (true) {
-            shared.lock.lock();
-            const done = shared.completions_head != null or shared.active_count == 0;
-            shared.lock.unlock();
-            if (done) return;
-
-            sleepNs(shared.poll_interval_ns);
-        }
-    }
-
-    fn popSubmission(shared: *Shared) ?*Request {
-        shared.lock.lock();
-        defer shared.lock.unlock();
-
-        const request = shared.submissions_head orelse return null;
-        shared.submissions_head = request.next;
-        if (shared.submissions_head == null) shared.submissions_tail = null;
-        request.next = null;
-        return request;
-    }
-
-    fn pushCompletion(shared: *Shared, request: *Request) void {
+    fn completeRequest(context: ?*anyopaque, request: *Request) void {
+        const shared: *Shared = @ptrCast(@alignCast(context.?));
         shared.lock.lock();
         defer shared.lock.unlock();
 
@@ -234,67 +227,13 @@ pub const RuntimeIo = struct {
         shared.completions_tail = request;
     }
 
-    fn shouldStop(shared: *Shared) bool {
-        shared.lock.lock();
-        defer shared.lock.unlock();
-
-        return shared.stopping and shared.submissions_head == null;
-    }
-
     fn discardCompletions(shared: *Shared) void {
         while (shared.completions_head) |request| {
             shared.completions_head = request.next;
             request.next = null;
-            shared.active_count -= 1;
+            shared.pending_count -= 1;
         }
         shared.completions_tail = null;
-    }
-
-    fn workerMain(shared: *Shared) void {
-        while (true) {
-            if (popSubmission(shared)) |request| {
-                process(shared.base, request);
-                pushCompletion(shared, request);
-                continue;
-            }
-
-            if (shouldStop(shared)) return;
-            sleepNs(shared.poll_interval_ns);
-        }
-    }
-
-    fn process(base_io: std.Io, request: *Request) void {
-        switch (request.payload) {
-            .operate => |*operate| {
-                operate.result = base_io.vtable.operate(base_io.userdata, operate.operation);
-            },
-            .batch_await_async => |*batch_await_async| {
-                batch_await_async.result = base_io.vtable.batchAwaitAsync(base_io.userdata, batch_await_async.batch);
-            },
-            .batch_await_concurrent => |*batch_await_concurrent| {
-                batch_await_concurrent.result = base_io.vtable.batchAwaitConcurrent(
-                    base_io.userdata,
-                    batch_await_concurrent.batch,
-                    batch_await_concurrent.timeout,
-                );
-            },
-            .sleep => |*sleep| {
-                sleep.result = base_io.vtable.sleep(base_io.userdata, sleep.timeout);
-            },
-        }
-    }
-
-    fn sleepNs(ns: u64) void {
-        if (ns == 0) {
-            std.atomic.spinLoopHint();
-            return;
-        }
-
-        var request: std.c.timespec = .{
-            .sec = @intCast(ns / std.time.ns_per_s),
-            .nsec = @intCast(ns % std.time.ns_per_s),
-        };
-        while (std.c.nanosleep(&request, &request) != 0) {}
     }
 };
 
@@ -480,7 +419,7 @@ fn actorIoGroupCancel(userdata: ?*anyopaque, group: *std.Io.Group, token: *anyop
 
 fn actorIoOperate(userdata: ?*anyopaque, operation: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
     const context = actorIoContext(userdata);
-    if (context.runtime_io.hasWorker()) {
+    if (context.runtime_io.hasDriver()) {
         var request: RuntimeIo.Request = .initOperate(context.charge_actor, operation);
         context.wait(&request);
         return request.payload.operate.result;
@@ -493,7 +432,7 @@ fn actorIoOperate(userdata: ?*anyopaque, operation: std.Io.Operation) std.Io.Can
 
 fn actorIoBatchAwaitAsync(userdata: ?*anyopaque, batch: *std.Io.Batch) std.Io.Cancelable!void {
     const context = actorIoContext(userdata);
-    if (context.runtime_io.hasWorker()) {
+    if (context.runtime_io.hasDriver()) {
         var request: RuntimeIo.Request = .initBatchAwaitAsync(context.charge_actor, batch);
         context.wait(&request);
         return request.payload.batch_await_async.result;
@@ -510,7 +449,7 @@ fn actorIoBatchAwaitConcurrent(
     timeout: std.Io.Timeout,
 ) std.Io.Batch.AwaitConcurrentError!void {
     const context = actorIoContext(userdata);
-    if (context.runtime_io.hasWorker()) {
+    if (context.runtime_io.hasDriver()) {
         var request: RuntimeIo.Request = .initBatchAwaitConcurrent(context.charge_actor, batch, timeout);
         context.wait(&request);
         return request.payload.batch_await_concurrent.result;
@@ -530,7 +469,7 @@ fn actorIoBatchCancel(userdata: ?*anyopaque, batch: *std.Io.Batch) void {
 
 fn actorIoSleep(userdata: ?*anyopaque, timeout: std.Io.Timeout) std.Io.Cancelable!void {
     const context = actorIoContext(userdata);
-    if (context.runtime_io.hasWorker()) {
+    if (context.runtime_io.hasDriver()) {
         var request: RuntimeIo.Request = .initSleep(context.charge_actor, timeout);
         context.wait(&request);
         return request.payload.sleep.result;
