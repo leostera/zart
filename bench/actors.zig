@@ -4,6 +4,7 @@ const zart = @import("zart");
 
 const KiB = 1024;
 const MiB = 1024 * KiB;
+const GiB = 1024 * MiB;
 
 const StopMsg = union(enum) {
     stop,
@@ -168,6 +169,67 @@ const SocketWriteActor = struct {
     }
 };
 
+const SocketThroughputReadMsg = union(enum) {
+    read: struct {
+        stream: std.Io.net.Stream,
+        total_bytes: usize,
+        io_buffer: []u8,
+        read_buffer: []u8,
+        bytes_read: *usize,
+    },
+};
+
+const SocketThroughputReadActor = struct {
+    pub const Msg = SocketThroughputReadMsg;
+
+    pub fn run(_: *@This(), ctx: *zart.Ctx(Msg)) !void {
+        switch (try ctx.recv()) {
+            .read => |request| {
+                var reader = request.stream.reader(ctx.io(), request.io_buffer);
+                var total: usize = 0;
+                while (total < request.total_bytes) {
+                    const remaining = request.total_bytes - total;
+                    const len = @min(request.read_buffer.len, remaining);
+                    try reader.interface.readSliceAll(request.read_buffer[0..len]);
+                    total += len;
+                }
+                request.bytes_read.* = total;
+            },
+        }
+    }
+};
+
+const SocketThroughputWriteMsg = union(enum) {
+    write: struct {
+        stream: std.Io.net.Stream,
+        total_bytes: usize,
+        chunk: []const u8,
+        buffer: []u8,
+        bytes_written: *usize,
+    },
+};
+
+const SocketThroughputWriteActor = struct {
+    pub const Msg = SocketThroughputWriteMsg;
+
+    pub fn run(_: *@This(), ctx: *zart.Ctx(Msg)) !void {
+        switch (try ctx.recv()) {
+            .write => |request| {
+                var writer = request.stream.writer(ctx.io(), request.buffer);
+                var total: usize = 0;
+                while (total < request.total_bytes) {
+                    const remaining = request.total_bytes - total;
+                    const len = @min(request.chunk.len, remaining);
+                    try writer.interface.writeAll(request.chunk[0..len]);
+                    total += len;
+                }
+                try writer.interface.flush();
+                request.bytes_written.* = total;
+            },
+        }
+    }
+};
+
 const ImmediateIoDriver = struct {
     completed: usize = 0,
 
@@ -209,6 +271,11 @@ const NToNCase = struct {
     messages: usize,
 };
 
+const SocketThroughputCase = struct {
+    total_bytes: usize,
+    chunk_size: usize,
+};
+
 const FiberBench = struct {
     fn complete(_: ?*anyopaque) anyerror!void {}
 
@@ -237,6 +304,28 @@ const Reporter = struct {
     fn timing(reporter: Reporter, name: []const u8, count: usize, stats: BenchStats) !void {
         const elapsed_s = @as(f64, @floatFromInt(stats.min_ns)) / @as(f64, @floatFromInt(std.time.ns_per_s));
         const per_second = if (elapsed_s == 0) 0 else @as(u64, @intFromFloat(@as(f64, @floatFromInt(count)) / elapsed_s));
+        try reporter.printStatsPrefix(name, stats);
+        try reporter.writer.print(" ops/s={d} iterations={d}\n", .{ per_second, stats.iterations });
+        try reporter.writer.flush();
+    }
+
+    fn throughput(reporter: Reporter, name: []const u8, bytes: usize, stats: BenchStats) !void {
+        const best_bytes_per_second = bytesPerSecond(bytes, @floatFromInt(stats.min_ns));
+        const mean_bytes_per_second = bytesPerSecond(bytes, stats.mean_ns);
+
+        try reporter.printStatsPrefix(name, stats);
+        try reporter.writer.print(" best=", .{});
+        try printByteRate(reporter.writer, best_bytes_per_second);
+        try reporter.writer.print(" mean_rate=", .{});
+        try printByteRate(reporter.writer, mean_bytes_per_second);
+        try reporter.writer.print(" best_B/s={d} iterations={d}\n", .{
+            @as(u64, @intFromFloat(best_bytes_per_second)),
+            stats.iterations,
+        });
+        try reporter.writer.flush();
+    }
+
+    fn printStatsPrefix(reporter: Reporter, name: []const u8, stats: BenchStats) !void {
         try reporter.writer.print("  {s}: min=", .{name});
         try printDuration(reporter.writer, @floatFromInt(stats.min_ns));
         try reporter.writer.print(" max=", .{});
@@ -249,8 +338,6 @@ const Reporter = struct {
         try printDuration(reporter.writer, stats.median_ns);
         try reporter.writer.print(" stddev=", .{});
         try printDuration(reporter.writer, stats.stddev_ns);
-        try reporter.writer.print(" ops/s={d} iterations={d}\n", .{ per_second, stats.iterations });
-        try reporter.writer.flush();
     }
 };
 
@@ -328,6 +415,33 @@ fn printDuration(writer: *std.Io.Writer, ns: f64) !void {
     try writer.print("{d:.2}s", .{ms / 1_000.0});
 }
 
+fn bytesPerSecond(bytes: usize, ns: f64) f64 {
+    if (ns == 0) return 0;
+    return @as(f64, @floatFromInt(bytes)) / (ns / @as(f64, @floatFromInt(std.time.ns_per_s)));
+}
+
+fn printByteRate(writer: *std.Io.Writer, bytes_per_second: f64) !void {
+    const abs_rate = @abs(bytes_per_second);
+    if (abs_rate < @as(f64, @floatFromInt(KiB))) {
+        try writer.print("{d:.2}B/s", .{bytes_per_second});
+        return;
+    }
+
+    const kib = bytes_per_second / @as(f64, @floatFromInt(KiB));
+    if (@abs(kib) < @as(f64, @floatFromInt(KiB))) {
+        try writer.print("{d:.2}KiB/s", .{kib});
+        return;
+    }
+
+    const mib = bytes_per_second / @as(f64, @floatFromInt(MiB));
+    if (@abs(mib) < @as(f64, @floatFromInt(KiB))) {
+        try writer.print("{d:.2}MiB/s", .{mib});
+        return;
+    }
+
+    try writer.print("{d:.2}GiB/s", .{bytes_per_second / @as(f64, @floatFromInt(GiB))});
+}
+
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
@@ -384,6 +498,7 @@ pub fn main(init: std.process.Init) !void {
     try benchOneToOne(reporter, options);
     try benchNToN(reporter, options);
     try benchIo(reporter, options);
+    try benchSocketThroughput(reporter, options);
 }
 
 fn usage(stdout: *std.Io.Writer) !void {
@@ -425,6 +540,28 @@ fn runMeasured(
     }
 
     try reporter.timing(name, count, BenchStats.fromSamples(samples));
+}
+
+fn runMeasuredThroughput(
+    reporter: Reporter,
+    options: Options,
+    name: []const u8,
+    byte_count: usize,
+    context: anytype,
+    comptime measure: anytype,
+) !void {
+    for (0..options.warmup) |_| {
+        _ = try measure(reporter, options, context);
+    }
+
+    const samples = try std.heap.page_allocator.alloc(i96, options.iterations);
+    defer std.heap.page_allocator.free(samples);
+
+    for (samples) |*sample| {
+        sample.* = try measure(reporter, options, context);
+    }
+
+    try reporter.throughput(name, byte_count, BenchStats.fromSamples(samples));
 }
 
 fn benchFiber(reporter: Reporter, options: Options) !void {
@@ -822,6 +959,191 @@ fn measureSocketReadWrite(reporter: Reporter, options: Options, byte_count: usiz
     const end = nowNs(reporter.io);
 
     if (!std.mem.eql(u8, write_data, read_data)) return error.UnexpectedNetworkRead;
+
+    return end - start;
+}
+
+fn benchSocketThroughput(reporter: Reporter, options: Options) !void {
+    try reporter.section("socket throughput");
+
+    const full_cases = [_]SocketThroughputCase{
+        .{ .total_bytes = 16 * MiB, .chunk_size = 4 * KiB },
+        .{ .total_bytes = 64 * MiB, .chunk_size = 64 * KiB },
+        .{ .total_bytes = 256 * MiB, .chunk_size = 256 * KiB },
+    };
+    const quick_cases = [_]SocketThroughputCase{
+        .{ .total_bytes = 1 * MiB, .chunk_size = 4 * KiB },
+        .{ .total_bytes = 8 * MiB, .chunk_size = 64 * KiB },
+    };
+    const cases = if (options.quick) quick_cases[0..] else full_cases[0..];
+
+    for (cases) |case| {
+        const actor_name = try std.fmt.allocPrint(
+            std.heap.page_allocator,
+            "actor ctx.io socket total={d} chunk={d}",
+            .{ case.total_bytes, case.chunk_size },
+        );
+        defer std.heap.page_allocator.free(actor_name);
+        try runMeasuredThroughput(reporter, options, actor_name, case.total_bytes, case, measureActorSocketThroughput);
+
+        const raw_name = try std.fmt.allocPrint(
+            std.heap.page_allocator,
+            "raw std.io socket total={d} chunk={d}",
+            .{ case.total_bytes, case.chunk_size },
+        );
+        defer std.heap.page_allocator.free(raw_name);
+        try runMeasuredThroughput(reporter, options, raw_name, case.total_bytes, case, measureRawStdIoSocketThroughput);
+    }
+}
+
+fn measureActorSocketThroughput(reporter: Reporter, options: Options, case: SocketThroughputCase) !i96 {
+    if (!@hasDecl(std.posix.system, "socketpair")) return error.UnsupportedBenchmark;
+
+    var sockets: [2]std.posix.fd_t = undefined;
+    switch (std.posix.errno(std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &sockets))) {
+        .SUCCESS => {},
+        else => return error.UnsupportedBenchmark,
+    }
+    defer closeFd(sockets[0]);
+    defer closeFd(sockets[1]);
+    try setNonblocking(sockets[0]);
+    try setNonblocking(sockets[1]);
+
+    const write_chunk = try std.heap.page_allocator.alloc(u8, case.chunk_size);
+    defer std.heap.page_allocator.free(write_chunk);
+    const write_io_buffer = try std.heap.page_allocator.alloc(u8, case.chunk_size);
+    defer std.heap.page_allocator.free(write_io_buffer);
+    const read_io_buffer = try std.heap.page_allocator.alloc(u8, case.chunk_size);
+    defer std.heap.page_allocator.free(read_io_buffer);
+    const read_buffer = try std.heap.page_allocator.alloc(u8, case.chunk_size);
+    defer std.heap.page_allocator.free(read_buffer);
+    @memset(write_chunk, 't');
+
+    var driver = zart.io.Default.init();
+    defer driver.deinit();
+
+    var rt = try zart.Runtime.init(std.heap.page_allocator, .{
+        .stack_size = options.stack_size,
+        .internal_allocator = std.heap.page_allocator,
+        .io = driver.driver(),
+    });
+    defer rt.deinit();
+
+    var bytes_read: usize = 0;
+    var bytes_written: usize = 0;
+    const reader = try rt.spawn(SocketThroughputReadActor{});
+    const writer = try rt.spawn(SocketThroughputWriteActor{});
+
+    try reader.send(.{ .read = .{
+        .stream = streamFromFd(sockets[0]),
+        .total_bytes = case.total_bytes,
+        .io_buffer = read_io_buffer,
+        .read_buffer = read_buffer,
+        .bytes_read = &bytes_read,
+    } });
+    try writer.send(.{ .write = .{
+        .stream = streamFromFd(sockets[1]),
+        .total_bytes = case.total_bytes,
+        .chunk = write_chunk,
+        .buffer = write_io_buffer,
+        .bytes_written = &bytes_written,
+    } });
+
+    const start = nowNs(reporter.io);
+    try rt.run();
+    const end = nowNs(reporter.io);
+
+    if (bytes_read != case.total_bytes) return error.UnexpectedNetworkRead;
+    if (bytes_written != case.total_bytes) return error.UnexpectedNetworkWrite;
+
+    return end - start;
+}
+
+const RawStdIoSocketWriterArgs = struct {
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    total_bytes: usize,
+    chunk: []const u8,
+    io_buffer: []u8,
+    start: *std.atomic.Value(bool),
+    bytes_written: usize = 0,
+    err: ?anyerror = null,
+};
+
+fn rawStdIoSocketWriter(args: *RawStdIoSocketWriterArgs) void {
+    rawStdIoSocketWriterRun(args) catch |err| {
+        args.err = err;
+    };
+}
+
+fn rawStdIoSocketWriterRun(args: *RawStdIoSocketWriterArgs) !void {
+    while (!args.start.load(.acquire)) std.atomic.spinLoopHint();
+
+    var writer = args.stream.writer(args.io, args.io_buffer);
+    var total: usize = 0;
+    while (total < args.total_bytes) {
+        const remaining = args.total_bytes - total;
+        const len = @min(args.chunk.len, remaining);
+        try writer.interface.writeAll(args.chunk[0..len]);
+        total += len;
+    }
+    try writer.interface.flush();
+    args.bytes_written = total;
+}
+
+fn measureRawStdIoSocketThroughput(reporter: Reporter, _: Options, case: SocketThroughputCase) !i96 {
+    if (!@hasDecl(std.posix.system, "socketpair")) return error.UnsupportedBenchmark;
+
+    var sockets: [2]std.posix.fd_t = undefined;
+    switch (std.posix.errno(std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &sockets))) {
+        .SUCCESS => {},
+        else => return error.UnsupportedBenchmark,
+    }
+    defer closeFd(sockets[0]);
+    defer closeFd(sockets[1]);
+
+    const write_chunk = try std.heap.page_allocator.alloc(u8, case.chunk_size);
+    defer std.heap.page_allocator.free(write_chunk);
+    const write_io_buffer = try std.heap.page_allocator.alloc(u8, case.chunk_size);
+    defer std.heap.page_allocator.free(write_io_buffer);
+    const read_io_buffer = try std.heap.page_allocator.alloc(u8, case.chunk_size);
+    defer std.heap.page_allocator.free(read_io_buffer);
+    const read_buffer = try std.heap.page_allocator.alloc(u8, case.chunk_size);
+    defer std.heap.page_allocator.free(read_buffer);
+    @memset(write_chunk, 't');
+
+    var start_gate = std.atomic.Value(bool).init(false);
+    var writer_args: RawStdIoSocketWriterArgs = .{
+        .io = reporter.io,
+        .stream = streamFromFd(sockets[1]),
+        .total_bytes = case.total_bytes,
+        .chunk = write_chunk,
+        .io_buffer = write_io_buffer,
+        .start = &start_gate,
+    };
+
+    const thread = try std.Thread.spawn(.{}, rawStdIoSocketWriter, .{&writer_args});
+    var joined = false;
+    defer if (!joined) thread.join();
+
+    var reader = streamFromFd(sockets[0]).reader(reporter.io, read_io_buffer);
+    var bytes_read: usize = 0;
+
+    const start = nowNs(reporter.io);
+    start_gate.store(true, .release);
+    while (bytes_read < case.total_bytes) {
+        const remaining = case.total_bytes - bytes_read;
+        const len = @min(read_buffer.len, remaining);
+        try reader.interface.readSliceAll(read_buffer[0..len]);
+        bytes_read += len;
+    }
+    thread.join();
+    joined = true;
+    const end = nowNs(reporter.io);
+
+    if (writer_args.err) |err| return err;
+    if (bytes_read != case.total_bytes) return error.UnexpectedNetworkRead;
+    if (writer_args.bytes_written != case.total_bytes) return error.UnexpectedNetworkWrite;
 
     return end - start;
 }
