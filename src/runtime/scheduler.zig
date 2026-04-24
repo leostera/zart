@@ -14,8 +14,8 @@ pub fn Scheduler(comptime ActorHeader: type) type {
 
         const Self = @This();
 
-        pub fn enqueue(scheduler: *Self, target: *ActorHeader) void {
-            if (target.queued.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
+        pub fn enqueue(scheduler: *Self, target: *ActorHeader) bool {
+            if (target.queued.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return false;
             target.next_run = null;
 
             if (scheduler.run_tail) |tail| {
@@ -24,6 +24,7 @@ pub fn Scheduler(comptime ActorHeader: type) type {
                 scheduler.run_head = target;
             }
             scheduler.run_tail = target;
+            return true;
         }
 
         pub fn dequeue(scheduler: *Self) ?*ActorHeader {
@@ -55,9 +56,9 @@ test "scheduler queues actors FIFO and skips duplicate enqueues" {
     var first: Header = .{ .id = 1 };
     var second: Header = .{ .id = 2 };
 
-    scheduler.enqueue(&first);
-    scheduler.enqueue(&first);
-    scheduler.enqueue(&second);
+    try testing.expect(scheduler.enqueue(&first));
+    try testing.expect(!scheduler.enqueue(&first));
+    try testing.expect(scheduler.enqueue(&second));
 
     try testing.expectEqual(@as(?*Header, &first), scheduler.dequeue());
     try testing.expectEqual(@as(?*Header, &second), scheduler.dequeue());

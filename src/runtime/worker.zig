@@ -24,8 +24,8 @@ pub fn Worker(comptime ActorHeader: type) type {
             return .{ .id = id };
         }
 
-        pub fn enqueue(worker: *Self, actor: *ActorHeader) void {
-            worker.scheduler.enqueue(actor);
+        pub fn enqueue(worker: *Self, actor: *ActorHeader) bool {
+            return worker.scheduler.enqueue(actor);
         }
 
         pub fn inject(worker: *Self, actor: *ActorHeader) bool {
@@ -79,7 +79,7 @@ test "worker delegates local scheduling" {
     var worker = Worker(Header).init(.{ .index = 0 });
     var actor: Header = .{ .id = 1 };
 
-    worker.enqueue(&actor);
+    try testing.expect(worker.enqueue(&actor));
     worker.setCurrent(&actor);
 
     try testing.expectEqual(@as(?*Header, &actor), worker.currentActor());
@@ -100,7 +100,7 @@ test "worker consumes remote injections after local queue" {
     var remote: Header = .{ .id = 2 };
 
     try testing.expect(worker.inject(&remote));
-    worker.enqueue(&local);
+    try testing.expect(worker.enqueue(&local));
 
     try testing.expectEqual(@as(?*Header, &local), worker.dequeue());
     try testing.expectEqual(@as(?*Header, &remote), worker.dequeue());

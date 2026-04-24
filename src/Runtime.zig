@@ -137,6 +137,9 @@ pub const Runtime = struct {
     retired: RetiredActors,
     workers: []Worker,
     next_external_spawn_worker: std.atomic.Value(usize),
+    runnable_count: std.atomic.Value(usize),
+    active_worker_count: std.atomic.Value(usize),
+    smp_quiescing: std.atomic.Value(bool),
     lifecycle: std.atomic.Value(RuntimeState),
 
     /// Creates a runtime. `allocator` is exposed to actors through `ctx.allocator()`.
@@ -175,6 +178,9 @@ pub const Runtime = struct {
             .retired = .{},
             .workers = workers,
             .next_external_spawn_worker = .init(0),
+            .runnable_count = .init(0),
+            .active_worker_count = .init(0),
+            .smp_quiescing = .init(false),
             .lifecycle = .init(.idle),
         };
     }
@@ -263,6 +269,7 @@ pub const Runtime = struct {
     pub fn runSmp(rt: *Runtime) !void {
         try rt.enterRun();
         defer rt.leaveRun();
+        rt.smp_quiescing.store(false, .release);
 
         if (rt.workers.len == 1) return rt.runSmpWorker(0);
 
@@ -359,12 +366,25 @@ pub const Runtime = struct {
         const current_worker = &rt.workers[worker_index];
 
         while (!rt.isStopping()) {
+            if (rt.smp_quiescing.load(.acquire)) return;
+
             if (worker_index == 0) {
                 try rt.pollIo(.nonblocking);
                 rt.drainIoCompletions();
+                if (rt.io.hasPoller() and rt.io.hasPending() and rt.runnable_count.load(.acquire) == 0) {
+                    try rt.pollIo(.wait);
+                    rt.drainIoCompletions();
+                    continue;
+                }
             }
 
-            if (!try rt.runReadyActor(current_worker)) return;
+            if (try rt.runReadyActor(current_worker)) continue;
+            if (rt.tryQuiesceSmp()) return;
+
+            switch (current_worker.wait(rt.options.scheduler_io)) {
+                .notified => {},
+                .closed => return,
+            }
         }
     }
 
@@ -374,6 +394,9 @@ pub const Runtime = struct {
         defer rt.reclaimRetiredActors();
 
         if (ready.loadState() != .runnable) return true;
+
+        _ = rt.active_worker_count.fetchAdd(1, .acq_rel);
+        defer _ = rt.active_worker_count.fetchSub(1, .acq_rel);
 
         ready.storeState(.running);
         ready.storeWaitReason(.none);
@@ -468,7 +491,7 @@ pub const Runtime = struct {
 
         rt.actors.publish(&cell.header);
         rt.traceActorSpawned(actor_id);
-        rt.ownerWorker(&cell.header).enqueue(&cell.header);
+        rt.enqueueSpawn(&cell.header);
 
         return .{
             .raw = actor_id,
@@ -548,16 +571,46 @@ pub const Runtime = struct {
         const owner = rt.ownerWorker(target);
         if (rt.currentActor()) |current| {
             if (current.owner_worker == target.owner_worker) {
-                owner.enqueue(target);
+                if (owner.enqueue(target)) rt.noteRunnableQueued();
                 return;
             }
         }
 
-        owner.injectAndNotify(rt.options.scheduler_io, target);
+        if (owner.inject(target)) {
+            rt.noteRunnableQueued();
+            owner.notify(rt.options.scheduler_io);
+        }
     }
 
-    fn dequeue(_: *Runtime, target_worker: *Worker) ?*ActorHeader {
-        return target_worker.dequeue();
+    fn enqueueSpawn(rt: *Runtime, target: *ActorHeader) void {
+        const owner = rt.ownerWorker(target);
+        if (rt.currentActor() != null or rt.state() != .running) {
+            if (owner.enqueue(target)) rt.noteRunnableQueued();
+            return;
+        }
+
+        rt.enqueue(target);
+    }
+
+    fn dequeue(rt: *Runtime, target_worker: *Worker) ?*ActorHeader {
+        const target = target_worker.dequeue() orelse return null;
+        _ = rt.runnable_count.fetchSub(1, .acq_rel);
+        return target;
+    }
+
+    fn noteRunnableQueued(rt: *Runtime) void {
+        _ = rt.runnable_count.fetchAdd(1, .acq_rel);
+    }
+
+    fn tryQuiesceSmp(rt: *Runtime) bool {
+        if (rt.runnable_count.load(.acquire) != 0) return false;
+        if (rt.active_worker_count.load(.acquire) != 0) return false;
+        if (rt.io.hasPending()) return false;
+
+        if (rt.smp_quiescing.cmpxchgStrong(false, true, .acq_rel, .acquire) == null) {
+            for (rt.workers) |*target_worker| target_worker.notify(rt.options.scheduler_io);
+        }
+        return true;
     }
 
     fn destroyActor(rt: *Runtime, target: *ActorHeader) void {
@@ -1064,4 +1117,65 @@ test "runtime smp run executes actors on configured workers" {
 
     try testing.expectEqual(@as(usize, 2), completed.load(.acquire));
     try testing.expectEqual(Runtime.State.idle, rt.state());
+}
+
+test "runtime smp run wakes parked worker for remote send" {
+    const testing = std.testing;
+
+    const ReceiverMsg = union(enum) {
+        hit,
+    };
+
+    const SenderMsg = union(enum) {
+        go,
+    };
+
+    const Receiver = struct {
+        pub const Msg = ReceiverMsg;
+
+        ready: *std.atomic.Value(bool),
+        received: *std.atomic.Value(bool),
+
+        pub fn run(self: *@This(), ctx: *Ctx(ReceiverMsg)) !void {
+            self.ready.store(true, .release);
+            _ = try ctx.recv();
+            self.received.store(true, .release);
+        }
+    };
+
+    const Sender = struct {
+        pub const Msg = SenderMsg;
+
+        target: Actor(ReceiverMsg),
+        receiver_ready: *std.atomic.Value(bool),
+
+        pub fn run(self: *@This(), ctx: *Ctx(SenderMsg)) !void {
+            _ = try ctx.recv();
+            while (!self.receiver_ready.load(.acquire)) ctx.yield();
+            try self.target.send(.hit);
+        }
+    };
+
+    var rt = try Runtime.init(testing.allocator, .{
+        .worker_count = 2,
+        .execution_budget = 1,
+        .preallocate_stack_slab = false,
+    });
+    defer rt.deinit();
+
+    var receiver_ready = std.atomic.Value(bool).init(false);
+    var received = std.atomic.Value(bool).init(false);
+    const receiver = try rt.spawn(Receiver{
+        .ready = &receiver_ready,
+        .received = &received,
+    });
+    const sender = try rt.spawn(Sender{
+        .target = receiver,
+        .receiver_ready = &receiver_ready,
+    });
+
+    try sender.send(.go);
+    try rt.runSmp();
+
+    try testing.expect(received.load(.acquire));
 }
