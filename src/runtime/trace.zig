@@ -26,6 +26,8 @@ pub const TraceEvent = union(enum) {
     actor_yielded: ActorId,
     actor_completed: ActorId,
     actor_failed: FailureTrace,
+    io_submitted: ActorId,
+    io_completed: ActorId,
     message_sent: MessageTrace,
     message_received: ActorId,
 };

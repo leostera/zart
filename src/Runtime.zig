@@ -284,6 +284,7 @@ pub const Runtime = struct {
             switch (target.state) {
                 .waiting => switch (target.wait_reason) {
                     .io => {
+                        rt.traceActorIoCompleted(target.id);
                         target.wait_reason = .none;
                         target.state = .runnable;
                         rt.enqueue(target);
@@ -343,6 +344,14 @@ pub const Runtime = struct {
         }
     }
 
+    fn traceActorIoSubmitted(rt: *Runtime, actor_id: ActorId) void {
+        if (rt.options.tracer) |tracer| tracer.record(.{ .io_submitted = actor_id });
+    }
+
+    fn traceActorIoCompleted(rt: *Runtime, actor_id: ActorId) void {
+        if (rt.options.tracer) |tracer| tracer.record(.{ .io_completed = actor_id });
+    }
+
     fn traceMessageSent(rt: *Runtime, to: ActorId) void {
         if (rt.options.tracer) |tracer| {
             tracer.record(.{
@@ -368,6 +377,7 @@ fn chargeActorIo(runtime: *anyopaque, actor_header: *anyopaque) void {
 fn parkActorIo(runtime: *anyopaque, actor_header: *anyopaque) void {
     const rt: *Runtime = @ptrCast(@alignCast(runtime));
     const target: *ActorHeader = @ptrCast(@alignCast(actor_header));
+    if (target.wait_reason != .io) rt.traceActorIoSubmitted(target.id);
     rt.traceActorWaiting(target.id);
     target.state = .waiting;
     target.wait_reason = .io;

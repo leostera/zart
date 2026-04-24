@@ -1397,3 +1397,133 @@ test "tracer records runtime events" {
         else => return error.UnexpectedTraceEvent,
     }
 }
+
+test "tracer records actor io events" {
+    const testing = std.testing;
+
+    const FakeIo = struct {
+        const Self = @This();
+
+        const vtable: std.Io.VTable = blk: {
+            var table = std.Io.failing.vtable.*;
+            table.operate = operate;
+            break :blk table;
+        };
+
+        fn interface(self: *Self) std.Io {
+            return .{
+                .userdata = self,
+                .vtable = &vtable,
+            };
+        }
+
+        fn operate(_: ?*anyopaque, operation: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
+            return switch (operation) {
+                .file_read_streaming => .{ .file_read_streaming = 1 },
+                else => unreachable,
+            };
+        }
+    };
+
+    const WorkerMsg = union(enum) {
+        start,
+    };
+
+    const Recorder = struct {
+        events: [16]TraceEvent = undefined,
+        len: usize = 0,
+
+        fn tracer(recorder: *@This()) Tracer {
+            return .{
+                .context = recorder,
+                .event_fn = record,
+            };
+        }
+
+        fn record(context: ?*anyopaque, event: TraceEvent) void {
+            const recorder: *@This() = @ptrCast(@alignCast(context.?));
+            recorder.events[recorder.len] = event;
+            recorder.len += 1;
+        }
+    };
+
+    const Worker = struct {
+        pub const Msg = WorkerMsg;
+
+        pub fn run(_: *@This(), ctx: *Ctx(WorkerMsg)) !void {
+            switch (try ctx.recv()) {
+                .start => {
+                    var buffer: [1]u8 = undefined;
+                    var buffers = [_][]u8{buffer[0..]};
+                    const result = try std.Io.operate(ctx.io(), .{
+                        .file_read_streaming = .{
+                            .file = .stdin(),
+                            .data = &buffers,
+                        },
+                    });
+                    switch (result) {
+                        .file_read_streaming => |read_result| {
+                            try testing.expectEqual(@as(usize, 1), try read_result);
+                        },
+                        else => unreachable,
+                    }
+                },
+            }
+        }
+    };
+
+    var fake_io: FakeIo = .{};
+    var recorder: Recorder = .{};
+    var rt = try Runtime.init(testing.allocator, .{
+        .io = fake_io.interface(),
+        .io_poll_interval_ns = 1,
+        .tracer = recorder.tracer(),
+    });
+    defer rt.deinit();
+
+    const worker = try rt.spawn(Worker{});
+    try worker.send(.start);
+    try rt.run();
+
+    try testing.expectEqual(@as(usize, 9), recorder.len);
+
+    switch (recorder.events[0]) {
+        .actor_spawned => |actor_id| try testing.expectEqual(worker.any(), actor_id),
+        else => return error.UnexpectedTraceEvent,
+    }
+    switch (recorder.events[1]) {
+        .message_sent => |message| {
+            try testing.expectEqual(@as(?ActorId, null), message.from);
+            try testing.expectEqual(worker.any(), message.to);
+        },
+        else => return error.UnexpectedTraceEvent,
+    }
+    switch (recorder.events[2]) {
+        .actor_resumed => |actor_id| try testing.expectEqual(worker.any(), actor_id),
+        else => return error.UnexpectedTraceEvent,
+    }
+    switch (recorder.events[3]) {
+        .message_received => |actor_id| try testing.expectEqual(worker.any(), actor_id),
+        else => return error.UnexpectedTraceEvent,
+    }
+    switch (recorder.events[4]) {
+        .io_submitted => |actor_id| try testing.expectEqual(worker.any(), actor_id),
+        else => return error.UnexpectedTraceEvent,
+    }
+    switch (recorder.events[5]) {
+        .actor_waiting => |actor_id| try testing.expectEqual(worker.any(), actor_id),
+        else => return error.UnexpectedTraceEvent,
+    }
+    switch (recorder.events[6]) {
+        .io_completed => |actor_id| try testing.expectEqual(worker.any(), actor_id),
+        else => return error.UnexpectedTraceEvent,
+    }
+    switch (recorder.events[7]) {
+        .actor_resumed => |actor_id| try testing.expectEqual(worker.any(), actor_id),
+        else => return error.UnexpectedTraceEvent,
+    }
+    switch (recorder.events[8]) {
+        .actor_completed => |actor_id| try testing.expectEqual(worker.any(), actor_id),
+        else => return error.UnexpectedTraceEvent,
+    }
+}
