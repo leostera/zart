@@ -134,6 +134,34 @@ pub fn build(b: *std.Build) void {
         bench_cmd.addArgs(args);
     }
 
+    const example_names = [_][]const u8{
+        "counter",
+        "ping_pong",
+        "fan_out",
+        "cooperative_yield",
+        "tracing",
+        "file_io",
+    };
+    const examples_step = b.step("examples", "Build all examples");
+    for (example_names) |example_name| {
+        const example_exe = b.addExecutable(.{
+            .name = b.fmt("zart-example-{s}", .{example_name}),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(b.fmt("examples/{s}.zig", .{example_name})),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "zart", .module = mod },
+                },
+            }),
+        });
+        examples_step.dependOn(&example_exe.step);
+
+        const example_step = b.step(b.fmt("example-{s}", .{example_name}), b.fmt("Run the {s} example", .{example_name}));
+        const example_cmd = b.addRunArtifact(example_exe);
+        example_step.dependOn(&example_cmd.step);
+    }
+
     // Creates an executable that will run `test` blocks from the provided module.
     // Here `mod` needs to define a target, which is why earlier we made sure to
     // set the releative field.

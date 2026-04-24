@@ -10,6 +10,7 @@ Run Zig commands with a timeout when possible:
 
 ```sh
 timeout 120 zig build test
+timeout 120 zig build examples
 timeout 120 zig build bench -- --quick
 ```
 
@@ -31,11 +32,13 @@ Messages are structurally copied into actor inboxes. Pointer fields remain refer
 
 ## Current Runtime Shape
 
-The runtime is currently single-threaded and cooperative. Actors run on stackful fibers. `ctx.recv()` parks until a message arrives, `ctx.yield()` cooperates at CPU checkpoints, and `ctx.io()` exposes a non-blocking `std.Io` facade backed by a runtime-provided driver.
+The runtime is cooperative inside actors and SMP by default across scheduler workers. Actors run on stackful fibers. `ctx.recv()` parks until a message arrives, `ctx.yield()` cooperates at CPU checkpoints, and `ctx.io()` exposes a non-blocking `std.Io` facade backed by a runtime-provided driver.
+
+Use `Runtime.run()` for execution. `Runtime.Options.worker_count = 0` uses the host logical CPU count; tests that need deterministic single-worker semantics should set `.worker_count = 1`.
 
 The runtime is intentionally split across modules under `src/runtime/`. Avoid growing `src/Runtime.zig` into a god module.
 
-Planned work includes monitors/links, stronger mailbox internals for SMP, multicore schedulers with work stealing, and `spawn_blocking`.
+Planned work includes monitors/links, stronger lock-free mailbox internals for SMP, poller wake integration, and `spawn_blocking`.
 
 ## Tests And Benchmarks
 
@@ -48,3 +51,5 @@ zig build bench -- --quick --warmup 5 --iterations 1000
 ```
 
 Benchmark output reports min/max/avg/mean/median/stddev with adaptive time units.
+
+Examples live under `examples/` and should compile with `zig build examples`. Individual examples run as `zig build example-counter`, `zig build example-file_io`, and so on.

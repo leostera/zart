@@ -13,6 +13,7 @@ Use timeouts for long-running commands when working locally or through an agent:
 
 ```sh
 timeout 120 zig build test
+timeout 120 zig build examples
 timeout 120 zig build bench -- --quick
 timeout 120 zig build bench -- --quick --warmup 5 --iterations 1000
 ```
@@ -22,6 +23,7 @@ Useful build commands:
 ```sh
 zig build
 zig build test
+zig build examples
 zig build bench -- --quick
 zig build bench -Doptimize=ReleaseFast -- --quick
 ```
@@ -34,11 +36,13 @@ Messages are copied structurally into actor inboxes. Do not add implicit deep-co
 
 Actors should be cheap to spawn. Runtime internals should keep allocation paths visible and benchmarked.
 
-Scheduling is cooperative today. `ctx.recv()` parks, `ctx.yield()` cooperates at CPU checkpoints, and actor I/O must be non-blocking.
+Scheduling is cooperative inside actors and SMP by default across runtime workers. `ctx.recv()` parks, `ctx.yield()` cooperates at CPU checkpoints, and actor I/O must be non-blocking.
 
 Runtime policy belongs in `Runtime.Options` so tests can force small budgets, small stacks, custom allocators, custom tracers, and custom I/O drivers.
 
 Keep `src/Runtime.zig` as orchestration glue. Put focused internals under `src/runtime/`.
+
+Use `rt.run()` for runtime execution. Deterministic scheduler tests should set `.worker_count = 1`; SMP behavior belongs in focused tests such as `tests/runtime/smp.zig`.
 
 ## Tests
 
@@ -71,6 +75,16 @@ zig build bench -Doptimize=ReleaseFast -- --quick --warmup 5 --iterations 1000
 ```
 
 When optimizing a path, add or refine a benchmark that isolates the cost first. Useful slices include fiber init, fiber run, fiber yield/resume, stack acquire/release, actor cell allocation, actor spawn, one-to-one sends, N-to-N sends, and synthetic I/O.
+
+## Examples
+
+Examples live under `examples/` and should compile with:
+
+```sh
+zig build examples
+```
+
+Add a small runnable example when introducing a user-facing runtime capability. Prefer examples that use the public `Actor(Msg)`, `Ctx(Msg)`, and `Runtime.run()` APIs without reaching into runtime internals.
 
 ## Style
 

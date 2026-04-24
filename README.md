@@ -17,17 +17,19 @@ Implemented today:
 - `ctx.recv()` parking and `ctx.yield()` CPU checkpoints.
 - Configurable execution and I/O budgets.
 - Non-blocking actor I/O facade through runtime-provided `std.Io` drivers.
+- Default multicore scheduler with worker parking and work stealing.
+- POSIX file and stream socket I/O backend through `zart.io.Default`.
 - Runtime tracing hooks.
 - Stack slab pooling for actor fibers.
+- Runnable examples under `examples/`.
 - Runtime tests and actor/fiber benchmarks.
 
 Planned:
 
 - Monitors and links.
-- Multicore schedulers with work stealing.
 - Lock-free SMP-ready mailboxes.
 - `spawn_blocking`.
-- Concrete non-blocking file and network drivers.
+- Poller wake fd/event integration for lower-latency cross-worker I/O submits.
 
 ## Example
 
@@ -118,6 +120,7 @@ var rt = try zart.Runtime.init(allocator, .{
     .preallocate_stack_slab = true,
     .execution_budget = 64,
     .io_budget = 64,
+    .worker_count = 0,
     .internal_allocator = std.heap.smp_allocator,
     .tracer = null,
     .io = null,
@@ -125,6 +128,8 @@ var rt = try zart.Runtime.init(allocator, .{
 ```
 
 Actors receive `ctx.allocator()` from the allocator passed to `Runtime.init`. Runtime internals use `internal_allocator`, defaulting to `std.heap.smp_allocator`.
+
+`worker_count = 0` uses the host logical CPU count. Set `worker_count = 1` for deterministic single-worker tests; the public execution API is still `rt.run()`.
 
 ## I/O
 
@@ -151,11 +156,28 @@ Pass `Runtime.Options.tracer` to observe runtime events without changing actor c
 
 Events include actor spawned/resumed/waiting/yielded/completed/failed, message sent/received, and I/O submitted/completed.
 
+## Examples
+
+Examples live under `examples/` and are wired into the build:
+
+```sh
+zig build examples
+zig build example-counter
+zig build example-ping_pong
+zig build example-fan_out
+zig build example-cooperative_yield
+zig build example-tracing
+zig build example-file_io
+```
+
+They cover typed request/reply actors, ping-pong messaging, fan-out aggregation, explicit `ctx.yield()` checkpoints, runtime tracing, and `ctx.io()` file reads.
+
 ## Build
 
 ```sh
 zig build
 zig build test
+zig build examples
 zig build bench -- --quick
 zig build bench -- --quick --warmup 5 --iterations 1000
 zig build bench -Doptimize=ReleaseFast -- --quick

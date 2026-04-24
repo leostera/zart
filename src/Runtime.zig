@@ -100,7 +100,7 @@ threadlocal var current_actor_header: ?*ActorHeader = null;
 ///
 /// Scheduling is cooperative inside each actor and multicore across scheduler
 /// workers. `Runtime.run()` starts the configured worker set and returns once
-/// the runtime has no runnable actors or pending I/O.
+/// the runtime has no runnable actors or evented pending I/O.
 pub const Runtime = struct {
     pub const State = RuntimeState;
 
