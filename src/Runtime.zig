@@ -134,6 +134,7 @@ pub const Runtime = struct {
     stacks: []StackPool,
     actors: Registry,
     lifetime_mutex: std.Io.Mutex,
+    trace_mutex: std.Io.Mutex,
     retired: RetiredActors,
     workers: []Worker,
     next_external_spawn_worker: std.atomic.Value(usize),
@@ -175,6 +176,7 @@ pub const Runtime = struct {
             .stacks = stacks,
             .actors = .{},
             .lifetime_mutex = .init,
+            .trace_mutex = .init,
             .retired = .{},
             .workers = workers,
             .next_external_spawn_worker = .init(0),
@@ -688,52 +690,57 @@ pub const Runtime = struct {
     }
 
     fn traceActorSpawned(rt: *Runtime, actor_id: ActorId) void {
-        if (rt.options.tracer) |tracer| tracer.record(.{ .actor_spawned = actor_id });
+        rt.recordTrace(.{ .actor_spawned = actor_id });
     }
 
     fn traceActorResumed(rt: *Runtime, actor_id: ActorId) void {
-        if (rt.options.tracer) |tracer| tracer.record(.{ .actor_resumed = actor_id });
+        rt.recordTrace(.{ .actor_resumed = actor_id });
     }
 
     fn traceActorWaiting(rt: *Runtime, actor_id: ActorId) void {
-        if (rt.options.tracer) |tracer| tracer.record(.{ .actor_waiting = actor_id });
+        rt.recordTrace(.{ .actor_waiting = actor_id });
     }
 
     fn traceActorYielded(rt: *Runtime, actor_id: ActorId) void {
-        if (rt.options.tracer) |tracer| tracer.record(.{ .actor_yielded = actor_id });
+        rt.recordTrace(.{ .actor_yielded = actor_id });
     }
 
     fn traceActorCompleted(rt: *Runtime, actor_id: ActorId) void {
-        if (rt.options.tracer) |tracer| tracer.record(.{ .actor_completed = actor_id });
+        rt.recordTrace(.{ .actor_completed = actor_id });
     }
 
     fn traceActorFailed(rt: *Runtime, actor_id: ActorId, err: anyerror) void {
-        if (rt.options.tracer) |tracer| {
-            tracer.record(.{ .actor_failed = .{ .actor = actor_id, .err = err } });
-        }
+        rt.recordTrace(.{ .actor_failed = .{ .actor = actor_id, .err = err } });
     }
 
     fn traceActorIoSubmitted(rt: *Runtime, actor_id: ActorId) void {
-        if (rt.options.tracer) |tracer| tracer.record(.{ .io_submitted = actor_id });
+        rt.recordTrace(.{ .io_submitted = actor_id });
     }
 
     fn traceActorIoCompleted(rt: *Runtime, actor_id: ActorId) void {
-        if (rt.options.tracer) |tracer| tracer.record(.{ .io_completed = actor_id });
+        rt.recordTrace(.{ .io_completed = actor_id });
     }
 
     fn traceMessageSent(rt: *Runtime, to: ActorId) void {
-        if (rt.options.tracer) |tracer| {
-            tracer.record(.{
-                .message_sent = .{
-                    .from = if (rt.currentActor()) |current| current.id else null,
-                    .to = to,
-                },
-            });
-        }
+        rt.recordTrace(.{
+            .message_sent = .{
+                .from = if (rt.currentActor()) |current| current.id else null,
+                .to = to,
+            },
+        });
     }
 
     fn traceMessageReceived(rt: *Runtime, actor_id: ActorId) void {
-        if (rt.options.tracer) |tracer| tracer.record(.{ .message_received = actor_id });
+        rt.recordTrace(.{ .message_received = actor_id });
+    }
+
+    fn recordTrace(rt: *Runtime, event: TraceEvent) void {
+        const tracer = rt.options.tracer orelse return;
+
+        rt.trace_mutex.lockUncancelable(rt.options.scheduler_io);
+        defer rt.trace_mutex.unlock(rt.options.scheduler_io);
+
+        tracer.record(event);
     }
 };
 
@@ -1329,4 +1336,58 @@ test "runtime workers can steal runnable actors" {
     try rt.runSmp();
 
     try testing.expect(stopped);
+}
+
+test "runtime serializes tracer calls during smp run" {
+    const testing = std.testing;
+
+    const Recorder = struct {
+        events: [64]TraceEvent = undefined,
+        len: usize = 0,
+
+        fn tracer(self: *@This()) Tracer {
+            return .{
+                .context = self,
+                .event_fn = record,
+            };
+        }
+
+        fn record(context: ?*anyopaque, event: TraceEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.events[self.len] = event;
+            self.len += 1;
+        }
+    };
+
+    const RunMsg = union(enum) {
+        run,
+    };
+
+    const WorkerActor = struct {
+        pub const Msg = RunMsg;
+
+        pub fn run(_: *@This(), ctx: *Ctx(RunMsg)) !void {
+            _ = try ctx.recv();
+        }
+    };
+
+    var recorder: Recorder = .{};
+    var rt = try Runtime.init(testing.allocator, .{
+        .worker_count = 2,
+        .preallocate_stack_slab = false,
+        .tracer = recorder.tracer(),
+    });
+    defer rt.deinit();
+
+    const first = try rt.spawn(WorkerActor{});
+    const second = try rt.spawn(WorkerActor{});
+    try first.send(.run);
+    try second.send(.run);
+    try rt.runSmp();
+
+    var completions: usize = 0;
+    for (recorder.events[0..recorder.len]) |event| {
+        if (event == .actor_completed) completions += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), completions);
 }
