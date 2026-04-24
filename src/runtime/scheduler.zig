@@ -4,6 +4,8 @@
 //! one `Scheduler`; the SMP runtime will give each worker its own scheduler
 //! plus remote injection and stealing paths.
 
+const std = @import("std");
+
 pub fn Scheduler(comptime ActorHeader: type) type {
     return struct {
         run_head: ?*ActorHeader = null,
@@ -13,8 +15,7 @@ pub fn Scheduler(comptime ActorHeader: type) type {
         const Self = @This();
 
         pub fn enqueue(scheduler: *Self, target: *ActorHeader) void {
-            if (target.queued) return;
-            target.queued = true;
+            if (target.queued.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
             target.next_run = null;
 
             if (scheduler.run_tail) |tail| {
@@ -31,7 +32,7 @@ pub fn Scheduler(comptime ActorHeader: type) type {
             if (scheduler.run_head == null) scheduler.run_tail = null;
 
             target.next_run = null;
-            target.queued = false;
+            target.queued.store(false, .release);
             return target;
         }
 
@@ -42,10 +43,10 @@ pub fn Scheduler(comptime ActorHeader: type) type {
 }
 
 test "scheduler queues actors FIFO and skips duplicate enqueues" {
-    const testing = @import("std").testing;
+    const testing = std.testing;
 
     const Header = struct {
-        queued: bool = false,
+        queued: std.atomic.Value(bool) = .init(false),
         next_run: ?*@This() = null,
         id: usize,
     };
@@ -61,6 +62,6 @@ test "scheduler queues actors FIFO and skips duplicate enqueues" {
     try testing.expectEqual(@as(?*Header, &first), scheduler.dequeue());
     try testing.expectEqual(@as(?*Header, &second), scheduler.dequeue());
     try testing.expectEqual(@as(?*Header, null), scheduler.dequeue());
-    try testing.expect(!first.queued);
-    try testing.expect(!second.queued);
+    try testing.expect(!first.queued.load(.acquire));
+    try testing.expect(!second.queued.load(.acquire));
 }
