@@ -585,7 +585,3 @@ fn TypeId(comptime T: type) type {
         var id: u8 = 0;
     };
 }
-
-test {
-    _ = @import("runtime/tests.zig");
-}

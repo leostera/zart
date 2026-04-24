@@ -15,8 +15,10 @@ pub const IoDriver = runtime.IoDriver;
 pub const IoRequest = runtime.IoRequest;
 pub const Ctx = runtime.Ctx;
 pub const MessageOf = runtime.MessageOf;
+pub const testing = @import("testing.zig");
 
 test {
     _ = runtime;
     _ = Fiber;
+    _ = testing;
 }
