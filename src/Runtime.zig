@@ -30,14 +30,12 @@ pub const TraceEvent = union(enum) {
 };
 
 pub const Tracer = struct {
-    context: ?*anyopaque = null,
-    event_fn: *const fn (?*anyopaque, TraceEvent) void = noop,
+    context: ?*anyopaque,
+    event_fn: *const fn (?*anyopaque, TraceEvent) void,
 
     pub fn record(tracer: Tracer, event: TraceEvent) void {
         tracer.event_fn(tracer.context, event);
     }
-
-    fn noop(_: ?*anyopaque, _: TraceEvent) void {}
 };
 
 const ActorState = enum {
@@ -68,7 +66,7 @@ pub const Runtime = struct {
         /// Number of explicit yield checkpoints an actor may pass per scheduler turn.
         execution_budget: usize = 64,
         internal_allocator: ?Allocator = null,
-        tracer: Tracer = .{},
+        tracer: ?Tracer = null,
     };
 
     allocator: Allocator,
@@ -112,12 +110,7 @@ pub const Runtime = struct {
 
     pub fn send(rt: *Runtime, comptime Msg: type, actor_id: ActorId, msg: Msg) !void {
         const actor = try rt.resolve(Msg, actor_id);
-        rt.trace(.{
-            .message_sent = .{
-                .from = if (rt.current_actor) |current| current.id else null,
-                .to = actor.id,
-            },
-        });
+        rt.traceMessageSent(actor.id);
         try actor.send_fn(actor, &msg);
         rt.wake(actor);
     }
@@ -128,7 +121,7 @@ pub const Runtime = struct {
 
             actor.state = .running;
             actor.budget_remaining = rt.executionBudget();
-            rt.trace(.{ .actor_resumed = actor.id });
+            rt.traceActorResumed(actor.id);
             rt.current_actor = actor;
             const status = actor.fiber.run() catch |err| {
                 rt.current_actor = null;
@@ -148,12 +141,12 @@ pub const Runtime = struct {
                 },
                 .completed => {
                     actor.state = .completed;
-                    rt.trace(.{ .actor_completed = actor.id });
+                    rt.traceActorCompleted(actor.id);
                 },
                 .failed => {
                     actor.state = .failed;
                     if (actor.fiber.failure()) |err| {
-                        rt.trace(.{ .actor_failed = .{ .actor = actor.id, .err = err } });
+                        rt.traceActorFailed(actor.id, err);
                         return err;
                     }
                 },
@@ -192,7 +185,7 @@ pub const Runtime = struct {
         errdefer cell.header.fiber.deinit();
 
         try rt.actors.append(rt.internal_allocator, &cell.header);
-        rt.trace(.{ .actor_spawned = actor_id });
+        rt.traceActorSpawned(actor_id);
         rt.enqueue(&cell.header);
 
         return .{
@@ -252,8 +245,45 @@ pub const Runtime = struct {
         return @max(rt.options.execution_budget, 1);
     }
 
-    fn trace(rt: *Runtime, event: TraceEvent) void {
-        rt.options.tracer.record(event);
+    fn traceActorSpawned(rt: *Runtime, actor_id: ActorId) void {
+        if (rt.options.tracer) |tracer| tracer.record(.{ .actor_spawned = actor_id });
+    }
+
+    fn traceActorResumed(rt: *Runtime, actor_id: ActorId) void {
+        if (rt.options.tracer) |tracer| tracer.record(.{ .actor_resumed = actor_id });
+    }
+
+    fn traceActorWaiting(rt: *Runtime, actor_id: ActorId) void {
+        if (rt.options.tracer) |tracer| tracer.record(.{ .actor_waiting = actor_id });
+    }
+
+    fn traceActorYielded(rt: *Runtime, actor_id: ActorId) void {
+        if (rt.options.tracer) |tracer| tracer.record(.{ .actor_yielded = actor_id });
+    }
+
+    fn traceActorCompleted(rt: *Runtime, actor_id: ActorId) void {
+        if (rt.options.tracer) |tracer| tracer.record(.{ .actor_completed = actor_id });
+    }
+
+    fn traceActorFailed(rt: *Runtime, actor_id: ActorId, err: anyerror) void {
+        if (rt.options.tracer) |tracer| {
+            tracer.record(.{ .actor_failed = .{ .actor = actor_id, .err = err } });
+        }
+    }
+
+    fn traceMessageSent(rt: *Runtime, to: ActorId) void {
+        if (rt.options.tracer) |tracer| {
+            tracer.record(.{
+                .message_sent = .{
+                    .from = if (rt.current_actor) |current| current.id else null,
+                    .to = to,
+                },
+            });
+        }
+    }
+
+    fn traceMessageReceived(rt: *Runtime, actor_id: ActorId) void {
+        if (rt.options.tracer) |tracer| tracer.record(.{ .message_received = actor_id });
     }
 };
 
@@ -282,11 +312,11 @@ pub fn Ctx(comptime Msg: type) type {
         pub fn recv(ctx: *@This()) !Msg {
             while (true) {
                 if (ctx.inbox.pop()) |msg| {
-                    ctx.runtime.trace(.{ .message_received = ctx.actor.id });
+                    ctx.runtime.traceMessageReceived(ctx.actor.id);
                     return msg;
                 }
 
-                ctx.runtime.trace(.{ .actor_waiting = ctx.actor.id });
+                ctx.runtime.traceActorWaiting(ctx.actor.id);
                 ctx.actor.state = .waiting;
                 Fiber.yield();
             }
@@ -299,7 +329,7 @@ pub fn Ctx(comptime Msg: type) type {
             }
 
             ctx.actor.budget_remaining = 0;
-            ctx.runtime.trace(.{ .actor_yielded = ctx.actor.id });
+            ctx.runtime.traceActorYielded(ctx.actor.id);
             ctx.actor.state = .runnable;
             ctx.runtime.enqueue(ctx.actor);
             Fiber.yield();
