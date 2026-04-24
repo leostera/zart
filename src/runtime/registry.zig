@@ -8,10 +8,13 @@ const ActorId = trace.ActorId;
 
 pub fn Registry(comptime ActorHeader: type) type {
     return struct {
-        slots: std.ArrayList(Slot) = .empty,
+        slabs: std.atomic.Value(?*Slab) = .init(null),
+        slot_count: std.atomic.Value(usize) = .init(0),
+        next_index: usize = 0,
         first_free: ?usize = null,
 
         const Self = @This();
+        const slots_per_slab = 1024;
 
         const Slot = struct {
             generation: std.atomic.Value(u64) = .init(1),
@@ -19,20 +22,31 @@ pub fn Registry(comptime ActorHeader: type) type {
             next_free: ?usize = null,
         };
 
+        const Slab = struct {
+            base_index: usize,
+            slots: []Slot,
+            next: ?*Slab,
+        };
+
         pub fn deinit(registry: *Self, allocator: Allocator, runtime: anytype) void {
-            for (registry.slots.items) |*slot| {
-                if (slot.actor.load(.acquire)) |actor| {
-                    actor.destroy_fn(runtime, actor);
-                    slot.actor.store(null, .release);
+            var slab = registry.slabs.load(.acquire);
+            while (slab) |current| {
+                for (current.slots) |*slot| {
+                    if (slot.actor.load(.acquire)) |actor| {
+                        actor.destroy_fn(runtime, actor);
+                        slot.actor.store(null, .release);
+                    }
                 }
+                slab = current.next;
+                allocator.free(current.slots);
+                allocator.destroy(current);
             }
-            registry.slots.deinit(allocator);
             registry.* = undefined;
         }
 
         pub fn reserve(registry: *Self, allocator: Allocator) !ActorId {
             if (registry.first_free) |index| {
-                const slot = &registry.slots.items[index];
+                const slot = registry.slotAt(index) orelse unreachable;
                 std.debug.assert(slot.actor.load(.acquire) == null);
 
                 registry.first_free = slot.next_free;
@@ -44,17 +58,19 @@ pub fn Registry(comptime ActorHeader: type) type {
                 };
             }
 
-            const index = registry.slots.items.len;
-            try registry.slots.append(allocator, .{});
+            const index = registry.next_index;
+            const slot = try registry.ensureSlot(allocator, index);
+            registry.next_index += 1;
+            registry.slot_count.store(registry.next_index, .release);
 
             return .{
                 .index = index,
-                .generation = registry.slots.items[index].generation.load(.acquire),
+                .generation = slot.generation.load(.acquire),
             };
         }
 
         pub fn cancelReserve(registry: *Self, actor_id: ActorId) void {
-            const slot = &registry.slots.items[actor_id.index];
+            const slot = registry.slotAt(actor_id.index) orelse unreachable;
             std.debug.assert(slot.actor.load(.acquire) == null);
             std.debug.assert(slot.generation.load(.acquire) == actor_id.generation);
             std.debug.assert(slot.next_free == null);
@@ -64,16 +80,16 @@ pub fn Registry(comptime ActorHeader: type) type {
         }
 
         pub fn publish(registry: *Self, actor: *ActorHeader) void {
-            const slot = &registry.slots.items[actor.id.index];
+            const slot = registry.slotAt(actor.id.index) orelse unreachable;
             std.debug.assert(slot.actor.load(.acquire) == null);
             std.debug.assert(slot.generation.load(.acquire) == actor.id.generation);
             slot.actor.store(actor, .release);
         }
 
         pub fn get(registry: *Self, actor_id: ActorId) ?*ActorHeader {
-            if (actor_id.index >= registry.slots.items.len) return null;
+            if (actor_id.index >= registry.slot_count.load(.acquire)) return null;
 
-            const slot = &registry.slots.items[actor_id.index];
+            const slot = registry.slotAt(actor_id.index) orelse return null;
             if (slot.generation.load(.acquire) != actor_id.generation) return null;
             const actor = slot.actor.load(.acquire) orelse return null;
             if (slot.generation.load(.acquire) != actor_id.generation) return null;
@@ -87,7 +103,7 @@ pub fn Registry(comptime ActorHeader: type) type {
 
         pub fn remove(registry: *Self, actor: *ActorHeader) void {
             const index = actor.id.index;
-            const slot = &registry.slots.items[index];
+            const slot = registry.slotAt(index) orelse unreachable;
             std.debug.assert(slot.actor.load(.acquire) == actor);
             std.debug.assert(slot.generation.load(.acquire) == actor.id.generation);
 
@@ -97,6 +113,37 @@ pub fn Registry(comptime ActorHeader: type) type {
             slot.generation.store(next_generation, .release);
             slot.next_free = registry.first_free;
             registry.first_free = index;
+        }
+
+        fn ensureSlot(registry: *Self, allocator: Allocator, index: usize) !*Slot {
+            if (registry.slotAt(index)) |slot| return slot;
+
+            const slab = try allocator.create(Slab);
+            errdefer allocator.destroy(slab);
+
+            const slots = try allocator.alloc(Slot, slots_per_slab);
+            errdefer allocator.free(slots);
+            for (slots) |*slot| slot.* = .{};
+
+            const base_index = index - (index % slots_per_slab);
+            slab.* = .{
+                .base_index = base_index,
+                .slots = slots,
+                .next = registry.slabs.load(.acquire),
+            };
+            registry.slabs.store(slab, .release);
+
+            return &slots[index - base_index];
+        }
+
+        fn slotAt(registry: *Self, index: usize) ?*Slot {
+            var slab = registry.slabs.load(.acquire);
+            while (slab) |current| : (slab = current.next) {
+                if (index >= current.base_index and index < current.base_index + current.slots.len) {
+                    return &current.slots[index - current.base_index];
+                }
+            }
+            return null;
         }
     };
 }
