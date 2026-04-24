@@ -263,7 +263,7 @@ const Context = if (supported) switch (builtin.cpu.arch) {
     }
 };
 
-inline fn switchContext(prev: *Context, next: *Context) void {
+noinline fn switchContext(prev: *Context, next: *Context) void {
     switch (builtin.cpu.arch) {
         .aarch64 => asm volatile (
             \\ ldr x2, [x1, #16]

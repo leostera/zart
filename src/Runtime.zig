@@ -4,6 +4,7 @@ const actor = @import("runtime/actor.zig");
 const inbox = @import("runtime/inbox.zig");
 const io = @import("runtime/io.zig");
 const registry = @import("runtime/registry.zig");
+const stack_pool = @import("runtime/stack_pool.zig");
 const trace = @import("runtime/trace.zig");
 
 const Allocator = std.mem.Allocator;
@@ -21,6 +22,7 @@ pub const IoRequest = RuntimeIo.Request;
 const ActorIoContext = io.ActorIoContext;
 const RuntimeIo = io.RuntimeIo;
 const Registry = registry.Registry(ActorHeader);
+const StackPool = stack_pool.StackPool;
 
 const ActorState = enum {
     runnable,
@@ -65,6 +67,10 @@ pub const Runtime = struct {
     pub const Options = struct {
         /// Stack bytes allocated for each actor fiber.
         stack_size: usize = 64 * 1024,
+        /// Bytes reserved per stack slab. Larger slabs make spawn cheaper at the cost of chunkier memory growth.
+        stack_slab_size: usize = 4 * 1024 * 1024,
+        /// Preallocate one stack slab during runtime initialization.
+        preallocate_stack_slab: bool = true,
         /// Number of explicit yield checkpoints an actor may pass per scheduler turn.
         execution_budget: usize = 64,
         /// Number of completed I/O boundaries an actor may pass per scheduler turn.
@@ -81,6 +87,7 @@ pub const Runtime = struct {
     internal_allocator: Allocator,
     options: Options,
     io: RuntimeIo,
+    stacks: StackPool,
     actors: Registry,
     run_head: ?*ActorHeader,
     run_tail: ?*ActorHeader,
@@ -89,11 +96,19 @@ pub const Runtime = struct {
     /// Creates a runtime. `allocator` is exposed to actors through `ctx.allocator()`.
     pub fn init(allocator: Allocator, options: Options) RuntimeIo.InitError!Runtime {
         const internal_allocator = options.internal_allocator orelse std.heap.smp_allocator;
+        var runtime_io = try RuntimeIo.init(internal_allocator, options.io);
+        errdefer runtime_io.deinit(internal_allocator);
+
+        var stacks = StackPool.init(internal_allocator, options.stack_size, options.stack_slab_size);
+        errdefer stacks.deinit();
+        if (options.preallocate_stack_slab) try stacks.preallocateSlab();
+
         return .{
             .allocator = allocator,
             .internal_allocator = internal_allocator,
             .options = options,
-            .io = try .init(internal_allocator, options.io),
+            .io = runtime_io,
+            .stacks = stacks,
             .actors = .{},
             .run_head = null,
             .run_tail = null,
@@ -103,8 +118,9 @@ pub const Runtime = struct {
 
     /// Destroys all live actors and runtime-owned internal storage.
     pub fn deinit(rt: *Runtime) void {
-        rt.io.deinit(rt.internal_allocator);
         rt.actors.deinit(rt.internal_allocator, rt);
+        rt.stacks.deinit();
+        rt.io.deinit(rt.internal_allocator);
         rt.* = undefined;
     }
 
@@ -193,15 +209,13 @@ pub const Runtime = struct {
     }
 
     fn spawnCell(rt: *Runtime, comptime Msg: type, comptime Cell: type, actor_value: anytype) !Actor(Msg) {
+        try rt.syncStackPoolPolicy();
+
         const cell = try rt.internal_allocator.create(Cell);
         errdefer rt.internal_allocator.destroy(cell);
 
-        const stack = try rt.internal_allocator.alignedAlloc(
-            u8,
-            std.mem.Alignment.fromByteUnits(Fiber.stack_alignment),
-            rt.options.stack_size,
-        );
-        errdefer rt.internal_allocator.free(stack);
+        const stack = try rt.stacks.alloc();
+        errdefer rt.stacks.free(stack);
 
         const actor_id = try rt.actors.reserve(rt.internal_allocator);
         errdefer rt.actors.cancelReserve(actor_id);
@@ -218,6 +232,15 @@ pub const Runtime = struct {
             .raw = actor_id,
             .runtime = rt,
         };
+    }
+
+    fn syncStackPoolPolicy(rt: *Runtime) Allocator.Error!void {
+        if (rt.stacks.matchesPolicy(rt.options.stack_size, rt.options.stack_slab_size)) return;
+
+        std.debug.assert(rt.stacks.live_count == 0);
+        rt.stacks.deinit();
+        rt.stacks = .init(rt.internal_allocator, rt.options.stack_size, rt.options.stack_slab_size);
+        if (rt.options.preallocate_stack_slab) try rt.stacks.preallocateSlab();
     }
 
     fn resolve(rt: *Runtime, comptime Msg: type, actor_id: ActorId) !*ActorHeader {
@@ -504,7 +527,7 @@ fn FunctionActorCell(comptime Msg: type, comptime entry: anytype) type {
             const cell: *Self = @ptrCast(@alignCast(header));
             cell.inbox.deinit();
             cell.header.fiber.deinit();
-            rt.internal_allocator.free(cell.header.stack);
+            rt.stacks.free(cell.header.stack);
             rt.internal_allocator.destroy(cell);
         }
     };
@@ -565,7 +588,7 @@ fn StructActorCell(comptime Msg: type, comptime ActorType: type) type {
             const cell: *Self = @ptrCast(@alignCast(header));
             cell.inbox.deinit();
             cell.header.fiber.deinit();
-            rt.internal_allocator.free(cell.header.stack);
+            rt.stacks.free(cell.header.stack);
             rt.internal_allocator.destroy(cell);
         }
     };
