@@ -620,6 +620,126 @@ test "std Io operate parks actor until worker completion" {
     try testing.expectEqual(@as(usize, 1), fake_io.operate_calls.load(.monotonic));
 }
 
+test "std Io batch waits park actor until worker completion" {
+    const testing = std.testing;
+
+    const FakeIo = struct {
+        async_calls: std.atomic.Value(usize) = .init(0),
+        concurrent_calls: std.atomic.Value(usize) = .init(0),
+
+        const Self = @This();
+
+        const vtable: std.Io.VTable = blk: {
+            var table = std.Io.failing.vtable.*;
+            table.batchAwaitAsync = batchAwaitAsync;
+            table.batchAwaitConcurrent = batchAwaitConcurrent;
+            break :blk table;
+        };
+
+        fn interface(self: *Self) std.Io {
+            return .{
+                .userdata = self,
+                .vtable = &vtable,
+            };
+        }
+
+        fn batchAwaitAsync(context: ?*anyopaque, batch: *std.Io.Batch) std.Io.Cancelable!void {
+            const self: *Self = @ptrCast(@alignCast(context.?));
+            _ = batch;
+            _ = self.async_calls.fetchAdd(1, .monotonic);
+        }
+
+        fn batchAwaitConcurrent(
+            context: ?*anyopaque,
+            batch: *std.Io.Batch,
+            timeout: std.Io.Timeout,
+        ) std.Io.Batch.AwaitConcurrentError!void {
+            const self: *Self = @ptrCast(@alignCast(context.?));
+            _ = batch;
+            _ = timeout;
+            _ = self.concurrent_calls.fetchAdd(1, .monotonic);
+        }
+    };
+
+    const Trace = struct {
+        items: [8]u8 = undefined,
+        len: usize = 0,
+
+        fn push(self: *@This(), item: u8) void {
+            self.items[self.len] = item;
+            self.len += 1;
+        }
+
+        fn slice(self: *const @This()) []const u8 {
+            return self.items[0..self.len];
+        }
+    };
+
+    const WorkerMsg = union(enum) {
+        start,
+    };
+
+    const OtherMsg = union(enum) {
+        hit,
+    };
+
+    const Actors = struct {
+        const Worker = struct {
+            pub const Msg = WorkerMsg;
+
+            trace: *Trace,
+
+            pub fn run(self: *@This(), ctx: *Ctx(Msg)) !void {
+                switch (try ctx.recv()) {
+                    .start => {
+                        var async_storage: [1]std.Io.Operation.Storage = undefined;
+                        var async_batch: std.Io.Batch = .init(&async_storage);
+                        var concurrent_storage: [1]std.Io.Operation.Storage = undefined;
+                        var concurrent_batch: std.Io.Batch = .init(&concurrent_storage);
+
+                        self.trace.push('a');
+                        try async_batch.awaitAsync(ctx.io());
+                        self.trace.push('c');
+                        try concurrent_batch.awaitConcurrent(ctx.io(), .none);
+                        self.trace.push('d');
+                    },
+                }
+            }
+        };
+
+        const Other = struct {
+            pub const Msg = OtherMsg;
+
+            trace: *Trace,
+
+            pub fn run(self: *@This(), ctx: *Ctx(Msg)) !void {
+                switch (try ctx.recv()) {
+                    .hit => self.trace.push('b'),
+                }
+            }
+        };
+    };
+
+    var fake_io: FakeIo = .{};
+    var rt = try Runtime.init(testing.allocator, .{
+        .io = fake_io.interface(),
+        .io_poll_interval_ns = 1,
+    });
+    defer rt.deinit();
+
+    var trace: Trace = .{};
+    const worker = try rt.spawn(Actors.Worker{ .trace = &trace });
+    const other = try rt.spawn(Actors.Other{ .trace = &trace });
+
+    try worker.send(.start);
+    try other.send(.hit);
+    try rt.run();
+
+    try testing.expectEqualStrings("abcd", trace.slice());
+    try testing.expectEqual(@as(usize, 1), fake_io.async_calls.load(.monotonic));
+    try testing.expectEqual(@as(usize, 1), fake_io.concurrent_calls.load(.monotonic));
+}
+
 test "run parks waiting actors until later sends wake them" {
     const testing = std.testing;
 

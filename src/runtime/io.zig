@@ -15,6 +15,8 @@ pub const RuntimeIo = struct {
 
         const Payload = union(enum) {
             operate: Operate,
+            batch_await_async: BatchAwaitAsync,
+            batch_await_concurrent: BatchAwaitConcurrent,
             sleep: Sleep,
         };
 
@@ -26,6 +28,17 @@ pub const RuntimeIo = struct {
         const Sleep = struct {
             timeout: std.Io.Timeout,
             result: std.Io.Cancelable!void = undefined,
+        };
+
+        const BatchAwaitAsync = struct {
+            batch: *std.Io.Batch,
+            result: std.Io.Cancelable!void = undefined,
+        };
+
+        const BatchAwaitConcurrent = struct {
+            batch: *std.Io.Batch,
+            timeout: std.Io.Timeout,
+            result: std.Io.Batch.AwaitConcurrentError!void = undefined,
         };
 
         pub fn initOperate(actor: *anyopaque, operation: std.Io.Operation) Request {
@@ -42,6 +55,27 @@ pub const RuntimeIo = struct {
                 .actor = actor,
                 .payload = .{
                     .sleep = .{ .timeout = timeout },
+                },
+            };
+        }
+
+        pub fn initBatchAwaitAsync(actor: *anyopaque, batch: *std.Io.Batch) Request {
+            return .{
+                .actor = actor,
+                .payload = .{
+                    .batch_await_async = .{ .batch = batch },
+                },
+            };
+        }
+
+        pub fn initBatchAwaitConcurrent(actor: *anyopaque, batch: *std.Io.Batch, timeout: std.Io.Timeout) Request {
+            return .{
+                .actor = actor,
+                .payload = .{
+                    .batch_await_concurrent = .{
+                        .batch = batch,
+                        .timeout = timeout,
+                    },
                 },
             };
         }
@@ -233,6 +267,16 @@ pub const RuntimeIo = struct {
         switch (request.payload) {
             .operate => |*operate| {
                 operate.result = base_io.vtable.operate(base_io.userdata, operate.operation);
+            },
+            .batch_await_async => |*batch_await_async| {
+                batch_await_async.result = base_io.vtable.batchAwaitAsync(base_io.userdata, batch_await_async.batch);
+            },
+            .batch_await_concurrent => |*batch_await_concurrent| {
+                batch_await_concurrent.result = base_io.vtable.batchAwaitConcurrent(
+                    base_io.userdata,
+                    batch_await_concurrent.batch,
+                    batch_await_concurrent.timeout,
+                );
             },
             .sleep => |*sleep| {
                 sleep.result = base_io.vtable.sleep(base_io.userdata, sleep.timeout);
@@ -449,6 +493,12 @@ fn actorIoOperate(userdata: ?*anyopaque, operation: std.Io.Operation) std.Io.Can
 
 fn actorIoBatchAwaitAsync(userdata: ?*anyopaque, batch: *std.Io.Batch) std.Io.Cancelable!void {
     const context = actorIoContext(userdata);
+    if (context.runtime_io.hasWorker()) {
+        var request: RuntimeIo.Request = .initBatchAwaitAsync(context.charge_actor, batch);
+        context.wait(&request);
+        return request.payload.batch_await_async.result;
+    }
+
     defer context.charge();
     const base = context.runtime_io.baseIo();
     return base.vtable.batchAwaitAsync(base.userdata, batch);
@@ -460,6 +510,12 @@ fn actorIoBatchAwaitConcurrent(
     timeout: std.Io.Timeout,
 ) std.Io.Batch.AwaitConcurrentError!void {
     const context = actorIoContext(userdata);
+    if (context.runtime_io.hasWorker()) {
+        var request: RuntimeIo.Request = .initBatchAwaitConcurrent(context.charge_actor, batch, timeout);
+        context.wait(&request);
+        return request.payload.batch_await_concurrent.result;
+    }
+
     defer context.charge();
     const base = context.runtime_io.baseIo();
     return base.vtable.batchAwaitConcurrent(base.userdata, batch, timeout);
