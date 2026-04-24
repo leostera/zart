@@ -258,8 +258,11 @@ pub const RuntimeIo = struct {
     const Shared = struct {
         driver: ?Driver,
         completions_incoming: std.atomic.Value(?*Request) = .init(null),
+        completions_mutex: std.Io.Mutex = .init,
         completions_local: ?*Request = null,
         pending_count: std.atomic.Value(usize) = .init(0),
+        notify_context: ?*anyopaque = null,
+        notify_fn: ?*const fn (?*anyopaque, *Request) void = null,
     };
 
     pub fn init(allocator: std.mem.Allocator, driver: ?Driver) InitError!RuntimeIo {
@@ -304,6 +307,15 @@ pub const RuntimeIo = struct {
         driver.submit(request);
     }
 
+    pub fn setCompletionNotify(
+        runtime_io: *RuntimeIo,
+        context: ?*anyopaque,
+        notify_fn: ?*const fn (?*anyopaque, *Request) void,
+    ) void {
+        runtime_io.shared.notify_context = context;
+        runtime_io.shared.notify_fn = notify_fn;
+    }
+
     pub fn hasPoller(runtime_io: *const RuntimeIo) bool {
         const driver = runtime_io.shared.driver orelse return false;
         return driver.poll_fn != null;
@@ -314,8 +326,12 @@ pub const RuntimeIo = struct {
         try driver.poll(mode);
     }
 
-    pub fn popCompletion(runtime_io: *RuntimeIo) ?*Request {
-        return popSharedCompletion(runtime_io.shared);
+    pub fn popCompletion(runtime_io: *RuntimeIo, sync_io: std.Io) ?*Request {
+        const shared = runtime_io.shared;
+        shared.completions_mutex.lockUncancelable(sync_io);
+        defer shared.completions_mutex.unlock(sync_io);
+
+        return popSharedCompletion(shared);
     }
 
     pub fn hasPending(runtime_io: *RuntimeIo) bool {
@@ -329,8 +345,9 @@ pub const RuntimeIo = struct {
         var head = shared.completions_incoming.load(.monotonic);
         while (true) {
             request.completion_next = head;
-            head = shared.completions_incoming.cmpxchgWeak(head, request, .release, .monotonic) orelse return;
+            head = shared.completions_incoming.cmpxchgWeak(head, request, .release, .monotonic) orelse break;
         }
+        if (shared.notify_fn) |notify_fn| notify_fn(shared.notify_context, request);
     }
 
     fn popSharedCompletion(shared: *Shared) ?*Request {
@@ -408,7 +425,7 @@ test "runtime io completion queue accepts concurrent producers" {
 
     var seen = [_]bool{false} ** Total;
     var count: usize = 0;
-    while (runtime_io.popCompletion()) |request| {
+    while (runtime_io.popCompletion(testing.io)) |request| {
         const index = @intFromPtr(request.actor) - @intFromPtr(&actors[0]);
         try testing.expect(index < Total);
         try testing.expect(!seen[index]);

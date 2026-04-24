@@ -240,6 +240,7 @@ pub const Runtime = struct {
     pub fn run(rt: *Runtime) !void {
         try rt.enterRun();
         defer rt.leaveRun();
+        rt.io.setCompletionNotify(rt, notifyIoCompletion);
 
         while (true) {
             if (rt.isStopping()) return;
@@ -269,6 +270,7 @@ pub const Runtime = struct {
     pub fn runSmp(rt: *Runtime) !void {
         try rt.enterRun();
         defer rt.leaveRun();
+        rt.io.setCompletionNotify(rt, notifyIoCompletion);
         rt.smp_quiescing.store(false, .release);
 
         if (rt.workers.len == 1) return rt.runSmpWorker(0);
@@ -368,6 +370,7 @@ pub const Runtime = struct {
         while (!rt.isStopping()) {
             if (rt.smp_quiescing.load(.acquire)) return;
 
+            rt.drainIoCompletions();
             if (worker_index == 0) {
                 try rt.pollIo(.nonblocking);
                 rt.drainIoCompletions();
@@ -627,7 +630,7 @@ pub const Runtime = struct {
     }
 
     fn drainIoCompletions(rt: *Runtime) void {
-        while (rt.io.popCompletion()) |request| {
+        while (rt.io.popCompletion(rt.options.scheduler_io)) |request| {
             const target: *ActorHeader = @ptrCast(@alignCast(request.actor));
             switch (target.loadState()) {
                 .waiting => switch (target.loadWaitReason()) {
@@ -725,6 +728,12 @@ fn chargeActorIo(runtime: *anyopaque, actor_header: *anyopaque) void {
     const rt: *Runtime = @ptrCast(@alignCast(runtime));
     const target: *ActorHeader = @ptrCast(@alignCast(actor_header));
     rt.chargeIoBoundary(target);
+}
+
+fn notifyIoCompletion(context: ?*anyopaque, request: *RuntimeIo.Request) void {
+    const rt: *Runtime = @ptrCast(@alignCast(context.?));
+    const target: *ActorHeader = @ptrCast(@alignCast(request.actor));
+    rt.ownerWorker(target).notify(rt.options.scheduler_io);
 }
 
 fn parkActorIo(runtime: *anyopaque, actor_header: *anyopaque) void {
@@ -1178,4 +1187,94 @@ test "runtime smp run wakes parked worker for remote send" {
     try rt.runSmp();
 
     try testing.expect(received.load(.acquire));
+}
+
+test "runtime smp run wakes owner worker for async io completion" {
+    const testing = std.testing;
+
+    const AsyncSleepDriver = struct {
+        mutex: std.Io.Mutex = .init,
+        condition: std.Io.Condition = .init,
+        request: ?*IoRequest = null,
+
+        const Self = @This();
+
+        fn driver(self: *Self) IoDriver {
+            return .{
+                .context = self,
+                .submit_fn = submit,
+            };
+        }
+
+        fn submit(context: ?*anyopaque, request: *IoRequest) void {
+            const self: *Self = @ptrCast(@alignCast(context.?));
+            self.mutex.lockUncancelable(testing.io);
+            defer self.mutex.unlock(testing.io);
+
+            self.request = request;
+            self.condition.signal(testing.io);
+        }
+
+        fn complete(self: *Self) void {
+            self.mutex.lockUncancelable(testing.io);
+            defer self.mutex.unlock(testing.io);
+
+            while (self.request == null) self.condition.waitUncancelable(testing.io, &self.mutex);
+            const request = self.request.?;
+            self.request = null;
+            request.completeSleep({});
+        }
+    };
+
+    const AsyncMsg = union(enum) {
+        run,
+    };
+
+    const Quick = struct {
+        pub const Msg = AsyncMsg;
+
+        pub fn run(_: *@This(), ctx: *Ctx(AsyncMsg)) !void {
+            _ = try ctx.recv();
+        }
+    };
+
+    const Sleeper = struct {
+        pub const Msg = AsyncMsg;
+
+        completed: *std.atomic.Value(bool),
+
+        pub fn run(self: *@This(), ctx: *Ctx(AsyncMsg)) !void {
+            _ = try ctx.recv();
+            try std.Io.Timeout.sleep(.none, ctx.io());
+            self.completed.store(true, .release);
+        }
+    };
+
+    const Completer = struct {
+        driver: *AsyncSleepDriver,
+
+        fn run(self: @This()) void {
+            self.driver.complete();
+        }
+    };
+
+    var driver: AsyncSleepDriver = .{};
+    var rt = try Runtime.init(testing.allocator, .{
+        .worker_count = 2,
+        .preallocate_stack_slab = false,
+        .io = driver.driver(),
+    });
+    defer rt.deinit();
+
+    var completed = std.atomic.Value(bool).init(false);
+    const quick = try rt.spawn(Quick{});
+    const sleeper = try rt.spawn(Sleeper{ .completed = &completed });
+    try quick.send(.run);
+    try sleeper.send(.run);
+
+    const completer = try std.Thread.spawn(.{}, Completer.run, .{Completer{ .driver = &driver }});
+    try rt.runSmp();
+    completer.join();
+
+    try testing.expect(completed.load(.acquire));
 }
