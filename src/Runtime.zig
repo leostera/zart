@@ -219,6 +219,11 @@ pub const Runtime = struct {
 
     /// Destroys all live actors and runtime-owned internal storage.
     pub fn deinit(rt: *Runtime) void {
+        switch (rt.state()) {
+            .idle, .stopped => {},
+            .running, .stopping => @panic("Runtime.deinit called while runtime is active"),
+        }
+
         rt.reclaimRetiredActors();
         rt.io.deinit(rt.internal_allocator);
         rt.actors.deinit(rt.internal_allocator, rt);
