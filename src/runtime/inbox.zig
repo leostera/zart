@@ -60,6 +60,10 @@ pub fn Inbox(comptime Msg: type) type {
             return msg;
         }
 
+        pub fn hasMessages(inbox: *const Self) bool {
+            return inbox.local_head != null or inbox.incoming.load(.acquire) != null;
+        }
+
         fn refillLocal(inbox: *Self) void {
             var stack = inbox.incoming.swap(null, .acquire);
             var reversed: ?*Node = null;

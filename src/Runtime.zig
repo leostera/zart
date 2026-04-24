@@ -36,6 +36,7 @@ const Worker = worker.Worker(ActorHeader);
 const ActorState = enum(u8) {
     runnable,
     running,
+    parking,
     waiting,
     completed,
     failed,
@@ -77,6 +78,14 @@ const ActorHeader = struct {
 
     fn storeState(header: *ActorHeader, state: ActorState) void {
         header.state.store(state, .release);
+    }
+
+    fn transitionState(header: *ActorHeader, expected: ActorState, new: ActorState) bool {
+        return header.state.cmpxchgStrong(expected, new, .acq_rel, .acquire) == null;
+    }
+
+    fn mustTransitionState(header: *ActorHeader, expected: ActorState, new: ActorState) void {
+        if (!header.transitionState(expected, new)) @panic("invalid actor state transition");
     }
 
     fn exchangeState(header: *ActorHeader, state: ActorState) ActorState {
@@ -415,7 +424,7 @@ pub const Runtime = struct {
 
         defer rt.reclaimRetiredActors();
 
-        if (ready.loadState() != .runnable) {
+        if (!ready.transitionState(.runnable, .running)) {
             rt.turn_mutex.unlock(rt.options.scheduler_io);
             return true;
         }
@@ -424,7 +433,6 @@ pub const Runtime = struct {
         rt.turn_mutex.unlock(rt.options.scheduler_io);
         defer _ = rt.active_worker_count.fetchSub(1, .acq_rel);
 
-        ready.storeState(.running);
         ready.storeWaitReason(.none);
         ready.budget_remaining = rt.executionBudget();
         ready.io_budget_remaining = rt.ioBudget();
@@ -443,10 +451,18 @@ pub const Runtime = struct {
             .running => unreachable,
             .suspended => switch (ready.loadState()) {
                 .running => {
-                    ready.storeState(.runnable);
+                    ready.mustTransitionState(.running, .runnable);
                     rt.enqueue(ready);
                 },
-                .runnable, .waiting => {},
+                .parking => {
+                    if (!ready.transitionState(.parking, .waiting)) {
+                        if (ready.loadState() == .runnable) rt.enqueue(ready);
+                    }
+                },
+                .runnable => {
+                    rt.enqueue(ready);
+                },
+                .waiting => {},
                 .completed, .failed => unreachable,
             },
             .completed => {
@@ -572,24 +588,41 @@ pub const Runtime = struct {
 
         return switch (target.loadState()) {
             .completed, .failed => error.ActorDead,
-            .runnable, .running, .waiting => target,
+            .runnable, .running, .parking, .waiting => target,
         };
     }
 
     fn wake(rt: *Runtime, target: *ActorHeader) void {
-        switch (target.loadState()) {
-            .waiting => {
-                switch (target.loadWaitReason()) {
-                    .recv => {
+        _ = rt.wakeForReason(target, .recv);
+    }
+
+    const WakeResult = enum {
+        none,
+        deferred,
+        queued,
+    };
+
+    fn wakeForReason(rt: *Runtime, target: *ActorHeader, reason: WaitReason) WakeResult {
+        while (true) {
+            const actor_state = target.loadState();
+            switch (actor_state) {
+                .waiting => {
+                    if (target.loadWaitReason() != reason) return .none;
+                    if (target.transitionState(.waiting, .runnable)) {
                         target.storeWaitReason(.none);
-                        target.storeState(.runnable);
                         rt.enqueue(target);
-                    },
-                    .io, .none => {},
-                }
-            },
-            .runnable, .running => {},
-            .completed, .failed => {},
+                        return .queued;
+                    }
+                },
+                .parking => {
+                    if (target.loadWaitReason() != reason) return .none;
+                    if (target.transitionState(.parking, .runnable)) {
+                        target.storeWaitReason(.none);
+                        return .deferred;
+                    }
+                },
+                .runnable, .running, .completed, .failed => return .none,
+            }
         }
     }
 
@@ -676,18 +709,7 @@ pub const Runtime = struct {
 
         while (rt.io.popCompletion(rt.options.scheduler_io)) |request| {
             const target: *ActorHeader = @ptrCast(@alignCast(request.actor));
-            switch (target.loadState()) {
-                .waiting => switch (target.loadWaitReason()) {
-                    .io => {
-                        rt.traceActorIoCompleted(target.id);
-                        target.storeWaitReason(.none);
-                        target.storeState(.runnable);
-                        rt.enqueue(target);
-                    },
-                    .recv, .none => {},
-                },
-                .runnable, .running, .completed, .failed => {},
-            }
+            if (rt.wakeForReason(target, .io) != .none) rt.traceActorIoCompleted(target.id);
         }
     }
 
@@ -711,10 +733,7 @@ pub const Runtime = struct {
         }
 
         target.io_budget_remaining = 0;
-        target.storeWaitReason(.none);
-        target.storeState(.runnable);
         rt.traceActorYielded(target.id);
-        rt.enqueue(target);
         Fiber.yield();
     }
 
@@ -792,7 +811,7 @@ pub const Runtime = struct {
                     .runnable => {
                         if (wait_reason != .none) return error.InvalidWaitReason;
                     },
-                    .running => return error.ActiveActorsAtRest,
+                    .running, .parking => return error.ActiveActorsAtRest,
                     .waiting => {
                         if (queued) return error.QueuedWaitingActor;
                         switch (wait_reason) {
@@ -835,7 +854,7 @@ fn parkActorIo(runtime: *anyopaque, actor_header: *anyopaque) void {
     if (target.loadWaitReason() != .io) rt.traceActorIoSubmitted(target.id);
     rt.traceActorWaiting(target.id);
     target.storeWaitReason(.io);
-    target.storeState(.waiting);
+    target.mustTransitionState(.running, .parking);
     Fiber.yield();
 }
 
@@ -865,12 +884,10 @@ pub fn Ctx(comptime Msg: type) type {
 
                 ctx.runtime.traceActorWaiting(ctx.actor.id);
                 ctx.actor.storeWaitReason(.recv);
-                ctx.actor.storeState(.waiting);
-                if (ctx.inbox.pop()) |msg| {
+                ctx.actor.mustTransitionState(.running, .parking);
+                if (ctx.inbox.hasMessages() and ctx.actor.transitionState(.parking, .running)) {
                     ctx.actor.storeWaitReason(.none);
-                    ctx.actor.storeState(.running);
-                    ctx.runtime.traceMessageReceived(ctx.actor.id);
-                    return msg;
+                    continue;
                 }
                 Fiber.yield();
             }
@@ -888,9 +905,6 @@ pub fn Ctx(comptime Msg: type) type {
 
             ctx.actor.budget_remaining = 0;
             ctx.runtime.traceActorYielded(ctx.actor.id);
-            ctx.actor.storeWaitReason(.none);
-            ctx.actor.storeState(.runnable);
-            ctx.runtime.enqueue(ctx.actor);
             Fiber.yield();
         }
 
