@@ -4,6 +4,7 @@ const actor = @import("runtime/actor.zig");
 const inbox = @import("runtime/inbox.zig");
 const concrete_io = @import("io.zig");
 const io = @import("runtime/io.zig");
+const reclamation = @import("runtime/reclamation.zig");
 const registry = @import("runtime/registry.zig");
 const stack_pool = @import("runtime/stack_pool.zig");
 const trace = @import("runtime/trace.zig");
@@ -25,6 +26,7 @@ pub const PosixIo = concrete_io.Posix;
 
 const ActorIoContext = io.ActorIoContext;
 const RuntimeIo = io.RuntimeIo;
+const RetiredActors = reclamation.RetiredActors(ActorHeader);
 const Registry = registry.Registry(ActorHeader);
 const StackPool = stack_pool.StackPool;
 const Worker = worker.Worker(ActorHeader);
@@ -54,6 +56,7 @@ const ActorHeader = struct {
     budget_remaining: usize,
     io_budget_remaining: usize,
     next_run: ?*ActorHeader,
+    next_retired: ?*ActorHeader,
     fiber: Fiber,
     stack: []align(Fiber.stack_alignment) u8,
     send_fn: *const fn (*ActorHeader, *const anyopaque) anyerror!void,
@@ -113,6 +116,7 @@ pub const Runtime = struct {
     io: RuntimeIo,
     stacks: StackPool,
     actors: Registry,
+    retired: RetiredActors,
     workers: []Worker,
 
     /// Creates a runtime. `allocator` is exposed to actors through `ctx.allocator()`.
@@ -139,12 +143,14 @@ pub const Runtime = struct {
             .io = runtime_io,
             .stacks = stacks,
             .actors = .{},
+            .retired = .{},
             .workers = workers,
         };
     }
 
     /// Destroys all live actors and runtime-owned internal storage.
     pub fn deinit(rt: *Runtime) void {
+        rt.reclaimRetiredActors();
         rt.actors.deinit(rt.internal_allocator, rt);
         rt.stacks.deinit();
         rt.io.deinit(rt.internal_allocator);
@@ -228,11 +234,13 @@ pub const Runtime = struct {
                     if (ready.fiber.failure()) |err| {
                         rt.traceActorFailed(ready.id, err);
                         rt.destroyActor(ready);
+                        rt.reclaimRetiredActors();
                         return err;
                     }
                     unreachable;
                 },
             }
+            rt.reclaimRetiredActors();
         }
     }
 
@@ -343,7 +351,12 @@ pub const Runtime = struct {
     }
 
     fn destroyActor(rt: *Runtime, target: *ActorHeader) void {
-        rt.actors.destroy(rt, target);
+        rt.actors.remove(target);
+        rt.retired.retire(target);
+    }
+
+    fn reclaimRetiredActors(rt: *Runtime) void {
+        rt.retired.drain(rt);
     }
 
     fn drainIoCompletions(rt: *Runtime) void {
@@ -554,6 +567,7 @@ fn FunctionActorCell(comptime Msg: type, comptime entry: anytype) type {
                     .budget_remaining = 0,
                     .io_budget_remaining = 0,
                     .next_run = null,
+                    .next_retired = null,
                     .fiber = undefined,
                     .stack = stack,
                     .send_fn = send,
@@ -615,6 +629,7 @@ fn StructActorCell(comptime Msg: type, comptime ActorType: type) type {
                     .budget_remaining = 0,
                     .io_budget_remaining = 0,
                     .next_run = null,
+                    .next_retired = null,
                     .fiber = undefined,
                     .stack = stack,
                     .send_fn = send,

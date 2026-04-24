@@ -79,12 +79,16 @@ pub fn Registry(comptime ActorHeader: type) type {
         }
 
         pub fn destroy(registry: *Self, runtime: anytype, actor: *ActorHeader) void {
+            registry.remove(actor);
+            actor.destroy_fn(runtime, actor);
+        }
+
+        pub fn remove(registry: *Self, actor: *ActorHeader) void {
             const index = actor.id.index;
             const slot = &registry.slots.items[index];
             std.debug.assert(slot.actor == actor);
             std.debug.assert(slot.generation == actor.id.generation);
 
-            actor.destroy_fn(runtime, actor);
             slot.actor = null;
             slot.generation +%= 1;
             if (slot.generation == 0) slot.generation = 1;
