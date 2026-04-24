@@ -273,6 +273,12 @@ const NToNCase = struct {
     messages: usize,
 };
 
+const SmpCase = struct {
+    workers: usize,
+    actors: usize,
+    messages: usize,
+};
+
 const SocketThroughputCase = struct {
     total_bytes: usize,
     chunk_size: usize,
@@ -501,6 +507,7 @@ pub fn main(init: std.process.Init) !void {
     try benchNToN(reporter, options);
     try benchIo(reporter, options);
     try benchSocketThroughput(reporter, options);
+    try benchSmpScaling(reporter, options);
 }
 
 fn usage(stdout: *std.Io.Writer) !void {
@@ -817,6 +824,75 @@ fn measureNToN(reporter: Reporter, options: Options, case: NToNCase) !i96 {
     return end - start;
 }
 
+fn benchSmpScaling(reporter: Reporter, options: Options) !void {
+    try reporter.section("smp scaling");
+    const full_cases = [_]SmpCase{
+        .{ .workers = 1, .actors = 256, .messages = 100_000 },
+        .{ .workers = 2, .actors = 256, .messages = 100_000 },
+        .{ .workers = 4, .actors = 256, .messages = 100_000 },
+        .{ .workers = 8, .actors = 256, .messages = 100_000 },
+    };
+    const quick_cases = [_]SmpCase{
+        .{ .workers = 1, .actors = 64, .messages = 10_000 },
+        .{ .workers = 2, .actors = 64, .messages = 10_000 },
+        .{ .workers = 4, .actors = 64, .messages = 10_000 },
+    };
+    const cases = if (options.quick) quick_cases[0..] else full_cases[0..];
+
+    for (cases) |case| {
+        const name = try std.fmt.allocPrint(
+            std.heap.page_allocator,
+            "smp N->N workers={d} actors={d} messages={d}",
+            .{ case.workers, case.actors, case.messages },
+        );
+        defer std.heap.page_allocator.free(name);
+
+        try runMeasured(reporter, options, name, case.messages, case, measureSmpNToN);
+    }
+}
+
+fn measureSmpNToN(reporter: Reporter, options: Options, case: SmpCase) !i96 {
+    var rt = try zart.Runtime.init(std.heap.page_allocator, .{
+        .stack_size = options.stack_size,
+        .worker_count = case.workers,
+        .internal_allocator = std.heap.page_allocator,
+    });
+    defer rt.deinit();
+
+    const actors = try std.heap.page_allocator.alloc(zart.Actor(NToNMsg), case.actors);
+    defer std.heap.page_allocator.free(actors);
+
+    for (actors) |*actor| {
+        actor.* = try rt.spawn(NToNActor{});
+    }
+
+    const base_sends = case.messages / case.actors;
+    const extra_sends = case.messages % case.actors;
+    const actor_count = if (base_sends == 0) extra_sends else case.actors;
+
+    for (actors[0..actor_count], 0..) |actor_handle, id| {
+        const sends = base_sends + if (id < extra_sends) @as(usize, 1) else 0;
+        try actor_handle.send(.{
+            .start = .{
+                .id = id,
+                .peers = actors,
+                .sends = sends,
+            },
+        });
+    }
+
+    const start = nowNs(reporter.io);
+    try rt.run();
+    const end = nowNs(reporter.io);
+
+    for (actors) |actor_handle| {
+        try actor_handle.send(.stop);
+    }
+    try rt.run();
+
+    return end - start;
+}
+
 fn benchIo(reporter: Reporter, options: Options) !void {
     try reporter.section("io");
     const full_cases = [_]usize{ 100_000, 1_000_000 };
@@ -1050,6 +1126,7 @@ fn measureActorSocketThroughput(reporter: Reporter, options: Options, case: Sock
 
     var rt = try zart.Runtime.init(std.heap.page_allocator, .{
         .stack_size = options.stack_size,
+        .worker_count = 4,
         .internal_allocator = std.heap.page_allocator,
         .io = driver.driver(),
     });
