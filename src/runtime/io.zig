@@ -338,6 +338,14 @@ pub const RuntimeIo = struct {
         return runtime_io.shared.pending_count.load(.acquire) != 0;
     }
 
+    pub fn hasCompletions(runtime_io: *RuntimeIo, sync_io: std.Io) bool {
+        const shared = runtime_io.shared;
+        shared.completions_mutex.lockUncancelable(sync_io);
+        defer shared.completions_mutex.unlock(sync_io);
+
+        return shared.completions_local != null or shared.completions_incoming.load(.acquire) != null;
+    }
+
     fn completeRequest(context: ?*anyopaque, request: *Request) void {
         const shared: *Shared = @ptrCast(@alignCast(context.?));
 

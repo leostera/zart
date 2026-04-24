@@ -43,7 +43,7 @@ test "function actor counter" {
         };
     };
 
-    var rt = try Runtime.init(testing.allocator, .{});
+    var rt = try Runtime.init(testing.allocator, .{ .worker_count = 1 });
     defer rt.deinit();
 
     var observed: u64 = 0;
@@ -105,7 +105,7 @@ test "struct actor counter" {
         };
     };
 
-    var rt = try Runtime.init(testing.allocator, .{});
+    var rt = try Runtime.init(testing.allocator, .{ .worker_count = 1 });
     defer rt.deinit();
 
     var observed: u64 = 0;
@@ -173,7 +173,7 @@ test "actor can spawn child actor" {
         };
     };
 
-    var rt = try Runtime.init(testing.allocator, .{});
+    var rt = try Runtime.init(testing.allocator, .{ .worker_count = 1 });
     defer rt.deinit();
 
     var observed: u64 = 0;
@@ -214,7 +214,7 @@ test "message sends structurally copy values but preserve references" {
         }
     };
 
-    var rt = try Runtime.init(testing.allocator, .{});
+    var rt = try Runtime.init(testing.allocator, .{ .worker_count = 1 });
     defer rt.deinit();
 
     var referenced: u64 = 1;

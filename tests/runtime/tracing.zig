@@ -63,7 +63,7 @@ test "tracer records actor-originated sends" {
     };
 
     var recorder: Recorder = .{};
-    var rt = try Runtime.init(testing.allocator, .{ .tracer = recorder.tracer() });
+    var rt = try Runtime.init(testing.allocator, .{ .worker_count = 1, .tracer = recorder.tracer() });
     defer rt.deinit();
 
     var seen = false;
@@ -129,7 +129,7 @@ test "tracer records actor failures" {
     };
 
     var recorder: Recorder = .{};
-    var rt = try Runtime.init(testing.allocator, .{ .tracer = recorder.tracer() });
+    var rt = try Runtime.init(testing.allocator, .{ .worker_count = 1, .tracer = recorder.tracer() });
     defer rt.deinit();
 
     const failing = try rt.spawn(FailingActor{});
@@ -188,7 +188,7 @@ test "tracer records runtime events" {
     };
 
     var recorder: Recorder = .{};
-    var rt = try Runtime.init(testing.allocator, .{ .tracer = recorder.tracer() });
+    var rt = try Runtime.init(testing.allocator, .{ .worker_count = 1, .tracer = recorder.tracer() });
     defer rt.deinit();
 
     const stopped = try rt.spawn(StopActor{});
@@ -295,6 +295,7 @@ test "tracer records actor io events" {
     var fake_driver: FakeDriver = .{};
     var recorder: Recorder = .{};
     var rt = try Runtime.init(testing.allocator, .{
+        .worker_count = 1,
         .io = fake_driver.driver(),
         .tracer = recorder.tracer(),
     });

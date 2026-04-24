@@ -94,6 +94,7 @@ test "randomized counter command streams match a reference model" {
         }
 
         var rt = try Runtime.init(testing.allocator, .{
+            .worker_count = 1,
             .execution_budget = schedule.execution_budget,
         });
         defer rt.deinit();
@@ -253,6 +254,7 @@ test "randomized multi-counter routing matches a reference model" {
         }
 
         var rt = try Runtime.init(testing.allocator, .{
+            .worker_count = 1,
             .execution_budget = schedule.execution_budget,
         });
         defer rt.deinit();

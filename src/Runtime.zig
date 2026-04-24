@@ -92,15 +92,15 @@ const ActorHeader = struct {
 
 threadlocal var current_actor_header: ?*ActorHeader = null;
 
-/// Scheduler-local actor runtime.
+/// Typed actor runtime.
 ///
 /// Actor handles are typed, and sending structurally copies the message value
 /// into the recipient inbox. Pointer fields remain references owned by user
 /// code.
 ///
-/// This scheduler is currently single-threaded and cooperative. The module
-/// boundaries keep the core ready for the planned SMP scheduler and work
-/// stealing queues.
+/// Scheduling is cooperative inside each actor and multicore across scheduler
+/// workers. `Runtime.run()` starts the configured worker set and returns once
+/// the runtime has no runnable actors or pending I/O.
 pub const Runtime = struct {
     pub const State = RuntimeState;
 
@@ -115,8 +115,8 @@ pub const Runtime = struct {
         execution_budget: usize = 64,
         /// Number of completed I/O boundaries an actor may pass per scheduler turn.
         io_budget: usize = 64,
-        /// Number of scheduler workers. Only worker 0 is executed until SMP run mode lands.
-        worker_count: usize = 1,
+        /// Number of scheduler workers. `0` uses the host logical CPU count.
+        worker_count: usize = 0,
         /// I/O implementation used only for scheduler parker futex/condition operations.
         scheduler_io: std.Io = std.Options.debug_io,
         /// Allocator used for actor cells, fiber stacks, registry slots, and inbox nodes.
@@ -133,6 +133,7 @@ pub const Runtime = struct {
     io: RuntimeIo,
     stacks: []StackPool,
     actors: Registry,
+    turn_mutex: std.Io.Mutex,
     lifetime_mutex: std.Io.Mutex,
     trace_mutex: std.Io.Mutex,
     retired: RetiredActors,
@@ -149,7 +150,7 @@ pub const Runtime = struct {
         var runtime_io = try RuntimeIo.init(internal_allocator, options.io);
         errdefer runtime_io.deinit(internal_allocator);
 
-        const worker_count = @max(options.worker_count, 1);
+        const worker_count = resolvedWorkerCount(options.worker_count);
         const workers = try internal_allocator.alloc(Worker, worker_count);
         errdefer internal_allocator.free(workers);
         for (workers, 0..) |*worker_slot, index| {
@@ -175,6 +176,7 @@ pub const Runtime = struct {
             .io = runtime_io,
             .stacks = stacks,
             .actors = .{},
+            .turn_mutex = .init,
             .lifetime_mutex = .init,
             .trace_mutex = .init,
             .retired = .{},
@@ -190,10 +192,10 @@ pub const Runtime = struct {
     /// Destroys all live actors and runtime-owned internal storage.
     pub fn deinit(rt: *Runtime) void {
         rt.reclaimRetiredActors();
+        rt.io.deinit(rt.internal_allocator);
         rt.actors.deinit(rt.internal_allocator, rt);
         for (rt.stacks) |*pool| pool.deinit();
         rt.internal_allocator.free(rt.stacks);
-        rt.io.deinit(rt.internal_allocator);
         rt.internal_allocator.free(rt.workers);
         rt.* = undefined;
     }
@@ -241,38 +243,8 @@ pub const Runtime = struct {
         return rt.lifecycle.load(.acquire);
     }
 
-    /// Runs runnable actors until no runnable actor remains or an actor fails.
+    /// Runs configured workers until no runnable actor or pending I/O remains, or an actor fails.
     pub fn run(rt: *Runtime) !void {
-        try rt.enterRun();
-        defer rt.leaveRun();
-        rt.io.setCompletionNotify(rt, notifyIoCompletion);
-
-        while (true) {
-            if (rt.isStopping()) return;
-
-            try rt.pollIo(.nonblocking);
-            rt.drainIoCompletions();
-
-            var made_progress = false;
-            for (rt.workers) |*current_worker| {
-                made_progress = try rt.runReadyActor(current_worker) or made_progress;
-            }
-            if (!made_progress) {
-                if (rt.io.hasPoller() and rt.io.hasPending()) {
-                    try rt.pollIo(.wait);
-                    rt.drainIoCompletions();
-                    continue;
-                }
-                return;
-            }
-        }
-    }
-
-    /// Runs configured workers on OS threads and waits for all workers to stop.
-    ///
-    /// This is the first SMP run mode. Idle parking, work stealing, and
-    /// per-worker I/O completion routing are layered on top in later slices.
-    pub fn runSmp(rt: *Runtime) !void {
         try rt.enterRun();
         defer rt.leaveRun();
         rt.io.setCompletionNotify(rt, notifyIoCompletion);
@@ -323,6 +295,7 @@ pub const Runtime = struct {
         };
 
         for (threads) |thread| thread.join();
+        spawned = 0;
 
         if (main_err) |err| return err;
         for (contexts) |context| {
@@ -369,6 +342,11 @@ pub const Runtime = struct {
         for (rt.workers) |*target_worker| target_worker.close(rt.options.scheduler_io);
     }
 
+    fn resolvedWorkerCount(configured: usize) usize {
+        if (configured != 0) return @max(configured, 1);
+        return std.Thread.getCpuCount() catch 1;
+    }
+
     fn runSmpWorker(rt: *Runtime, worker_index: usize) !void {
         const current_worker = &rt.workers[worker_index];
 
@@ -397,13 +375,21 @@ pub const Runtime = struct {
     }
 
     fn runReadyActor(rt: *Runtime, current_worker: *Worker) !bool {
-        const ready = rt.dequeue(current_worker) orelse return false;
+        rt.turn_mutex.lockUncancelable(rt.options.scheduler_io);
+        const ready = rt.dequeue(current_worker) orelse {
+            rt.turn_mutex.unlock(rt.options.scheduler_io);
+            return false;
+        };
 
         defer rt.reclaimRetiredActors();
 
-        if (ready.loadState() != .runnable) return true;
+        if (ready.loadState() != .runnable) {
+            rt.turn_mutex.unlock(rt.options.scheduler_io);
+            return true;
+        }
 
         _ = rt.active_worker_count.fetchAdd(1, .acq_rel);
+        rt.turn_mutex.unlock(rt.options.scheduler_io);
         defer _ = rt.active_worker_count.fetchSub(1, .acq_rel);
 
         ready.storeState(.running);
@@ -619,9 +605,15 @@ pub const Runtime = struct {
     }
 
     fn tryQuiesceSmp(rt: *Runtime) bool {
+        rt.turn_mutex.lockUncancelable(rt.options.scheduler_io);
+        defer rt.turn_mutex.unlock(rt.options.scheduler_io);
+
         if (rt.runnable_count.load(.acquire) != 0) return false;
         if (rt.active_worker_count.load(.acquire) != 0) return false;
-        if (rt.io.hasPending()) return false;
+        if (rt.io.hasCompletions(rt.options.scheduler_io)) return false;
+        if (rt.io.hasPoller() and rt.io.hasPending()) return false;
+        if (rt.runnable_count.load(.acquire) != 0) return false;
+        if (rt.active_worker_count.load(.acquire) != 0) return false;
 
         if (rt.smp_quiescing.cmpxchgStrong(false, true, .acq_rel, .acquire) == null) {
             for (rt.workers) |*target_worker| target_worker.notify(rt.options.scheduler_io);
@@ -645,6 +637,11 @@ pub const Runtime = struct {
     }
 
     fn drainIoCompletions(rt: *Runtime) void {
+        rt.turn_mutex.lockUncancelable(rt.options.scheduler_io);
+        defer rt.turn_mutex.unlock(rt.options.scheduler_io);
+
+        if (rt.active_worker_count.load(.acquire) != 0) return;
+
         while (rt.io.popCompletion(rt.options.scheduler_io)) |request| {
             const target: *ActorHeader = @ptrCast(@alignCast(request.actor));
             switch (target.loadState()) {
@@ -1054,7 +1051,7 @@ test "runtime returns to idle after a normal run" {
         }
     };
 
-    var rt = try Runtime.init(testing.allocator, .{});
+    var rt = try Runtime.init(testing.allocator, .{ .worker_count = 1 });
     defer rt.deinit();
 
     const stopper = try rt.spawn(Stopper{});
@@ -1094,7 +1091,7 @@ test "runtime stop exits after current actor turn" {
         }
     };
 
-    var rt = try Runtime.init(testing.allocator, .{});
+    var rt = try Runtime.init(testing.allocator, .{ .worker_count = 1 });
     defer rt.deinit();
 
     var stopper_ran = false;
@@ -1142,7 +1139,7 @@ test "runtime smp run executes actors on configured workers" {
 
     try first.send(.run);
     try second.send(.run);
-    try rt.runSmp();
+    try rt.run();
 
     try testing.expectEqual(@as(usize, 2), completed.load(.acquire));
     try testing.expectEqual(Runtime.State.idle, rt.state());
@@ -1204,7 +1201,7 @@ test "runtime smp run wakes parked worker for remote send" {
     });
 
     try sender.send(.go);
-    try rt.runSmp();
+    try rt.run();
 
     try testing.expect(received.load(.acquire));
 }
@@ -1223,6 +1220,7 @@ test "runtime smp run wakes owner worker for async io completion" {
             return .{
                 .context = self,
                 .submit_fn = submit,
+                .poll_fn = poll,
             };
         }
 
@@ -1243,6 +1241,17 @@ test "runtime smp run wakes owner worker for async io completion" {
             const request = self.request.?;
             self.request = null;
             request.completeSleep({});
+            self.condition.signal(testing.io);
+        }
+
+        fn poll(context: ?*anyopaque, mode: RuntimeIo.PollMode) !void {
+            if (mode == .nonblocking) return;
+
+            const self: *Self = @ptrCast(@alignCast(context.?));
+            self.mutex.lockUncancelable(testing.io);
+            defer self.mutex.unlock(testing.io);
+
+            while (self.request != null) self.condition.waitUncancelable(testing.io, &self.mutex);
         }
     };
 
@@ -1293,7 +1302,7 @@ test "runtime smp run wakes owner worker for async io completion" {
     try sleeper.send(.run);
 
     const completer = try std.Thread.spawn(.{}, Completer.run, .{Completer{ .driver = &driver }});
-    try rt.runSmp();
+    try rt.run();
     completer.join();
 
     try testing.expect(completed.load(.acquire));
@@ -1333,7 +1342,7 @@ test "runtime workers can steal runnable actors" {
 
     rt.enqueue(stolen);
     try stopper.send(.stop);
-    try rt.runSmp();
+    try rt.run();
 
     try testing.expect(stopped);
 }
@@ -1383,7 +1392,7 @@ test "runtime serializes tracer calls during smp run" {
     const second = try rt.spawn(WorkerActor{});
     try first.send(.run);
     try second.send(.run);
-    try rt.runSmp();
+    try rt.run();
 
     var completions: usize = 0;
     for (recorder.events[0..recorder.len]) |event| {

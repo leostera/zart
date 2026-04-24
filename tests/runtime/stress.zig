@@ -22,7 +22,7 @@ test "stress many short-lived actors release registry slots" {
         }
     };
 
-    var rt = try Runtime.init(testing.allocator, .{});
+    var rt = try Runtime.init(testing.allocator, .{ .worker_count = 1 });
     defer rt.deinit();
 
     var previous = try rt.spawn(StopActor{});

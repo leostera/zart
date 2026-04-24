@@ -62,7 +62,7 @@ test "yield lets another runnable actor run" {
         };
     };
 
-    var rt = try Runtime.init(testing.allocator, .{ .execution_budget = 1 });
+    var rt = try Runtime.init(testing.allocator, .{ .worker_count = 1, .execution_budget = 1 });
     defer rt.deinit();
 
     var timeline: Trace = .{};
@@ -133,7 +133,7 @@ test "execution budget controls yield switching" {
         };
     };
 
-    var rt = try Runtime.init(testing.allocator, .{ .execution_budget = 2 });
+    var rt = try Runtime.init(testing.allocator, .{ .worker_count = 1, .execution_budget = 2 });
     defer rt.deinit();
 
     var timeline: Trace = .{};
@@ -173,7 +173,7 @@ test "run parks waiting actors until later sends wake them" {
         }
     };
 
-    var rt = try Runtime.init(testing.allocator, .{});
+    var rt = try Runtime.init(testing.allocator, .{ .worker_count = 1 });
     defer rt.deinit();
 
     var items: [4]u8 = undefined;
@@ -225,7 +225,7 @@ test "messages to one actor are received in FIFO order" {
         }
     };
 
-    var rt = try Runtime.init(testing.allocator, .{});
+    var rt = try Runtime.init(testing.allocator, .{ .worker_count = 1 });
     defer rt.deinit();
 
     var observed: [64]u16 = undefined;
@@ -281,7 +281,7 @@ test "actor self handle can enqueue messages to itself" {
         }
     };
 
-    var rt = try Runtime.init(testing.allocator, .{ .execution_budget = 1 });
+    var rt = try Runtime.init(testing.allocator, .{ .worker_count = 1, .execution_budget = 1 });
     defer rt.deinit();
 
     var observed: [8]u8 = undefined;

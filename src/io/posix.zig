@@ -19,6 +19,7 @@ const Interest = enum {
 };
 
 pub const Posix = struct {
+    mutex: std.Io.Mutex = .init,
     pending_head: ?*RuntimeIo.Request = null,
     pending_tail: ?*RuntimeIo.Request = null,
 
@@ -44,27 +45,36 @@ pub const Posix = struct {
     fn submit(context: ?*anyopaque, request: *RuntimeIo.Request) void {
         const self: *Self = @ptrCast(@alignCast(context.?));
         if (self.tryComplete(request)) return;
+
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
         self.enqueue(request);
     }
 
     fn poll(context: ?*anyopaque, mode: RuntimeIo.PollMode) !void {
         const self: *Self = @ptrCast(@alignCast(context.?));
-        if (self.pending_head == null) return;
 
         var pollfds_buffer: [256]posix.pollfd = undefined;
         while (true) {
+            self.mutex.lockUncancelable(std.Options.debug_io);
             const pollfds = self.fillPollfds(&pollfds_buffer);
+            self.mutex.unlock(std.Options.debug_io);
             if (pollfds.len == 0) return;
 
             const timeout: i32 = switch (mode) {
                 .nonblocking => 0,
-                .wait => -1,
+                // TODO: replace this bounded wait with a poller wake fd so
+                // cross-worker submits can interrupt a sleeping poll call.
+                .wait => 1,
             };
             const ready = try posix.poll(pollfds, timeout);
             if (ready == 0) return;
 
+            self.mutex.lockUncancelable(std.Options.debug_io);
             self.retryReady(pollfds);
-            if (mode == .nonblocking or self.pending_head == null) return;
+            const empty = self.pending_head == null;
+            self.mutex.unlock(std.Options.debug_io);
+            if (mode == .nonblocking or empty) return;
         }
     }
 

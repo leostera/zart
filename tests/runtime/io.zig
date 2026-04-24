@@ -63,7 +63,7 @@ test "ctx io preserves std Io signature and delegates to runtime io" {
     };
 
     var fake_driver: FakeDriver = .{};
-    var rt = try Runtime.init(testing.allocator, .{ .io = fake_driver.driver() });
+    var rt = try Runtime.init(testing.allocator, .{ .worker_count = 1, .io = fake_driver.driver() });
     defer rt.deinit();
 
     var observed: u8 = 0;
@@ -136,6 +136,7 @@ test "std Io calls consume io budget and yield cooperatively" {
     };
 
     var rt = try Runtime.init(testing.allocator, .{
+        .worker_count = 1,
         .io_budget = 1,
     });
     defer rt.deinit();
@@ -241,6 +242,7 @@ test "std Io operate parks actor until non-blocking driver completion" {
 
     var fake_driver: FakeDriver = .{};
     var rt = try Runtime.init(testing.allocator, .{
+        .worker_count = 1,
         .io = fake_driver.driver(),
     });
     defer rt.deinit();
@@ -336,6 +338,7 @@ test "pending non-blocking io can complete after run returns" {
 
     var fake_driver: FakeDriver = .{};
     var rt = try Runtime.init(testing.allocator, .{
+        .worker_count = 1,
         .io = fake_driver.driver(),
     });
     defer rt.deinit();
@@ -450,6 +453,7 @@ test "std Io batch waits park actor until non-blocking driver completion" {
 
     var fake_driver: FakeDriver = .{};
     var rt = try Runtime.init(testing.allocator, .{
+        .worker_count = 1,
         .io = fake_driver.driver(),
     });
     defer rt.deinit();
@@ -500,7 +504,7 @@ test "posix io driver reads files through ctx io" {
     var posix_io = DefaultIo.init();
     defer posix_io.deinit();
 
-    var rt = try Runtime.init(testing.allocator, .{ .io = posix_io.driver() });
+    var rt = try Runtime.init(testing.allocator, .{ .worker_count = 1, .io = posix_io.driver() });
     defer rt.deinit();
 
     var out: [5]u8 = undefined;
@@ -539,7 +543,7 @@ test "posix io driver writes files through ctx io" {
     var posix_io = DefaultIo.init();
     defer posix_io.deinit();
 
-    var rt = try Runtime.init(testing.allocator, .{ .io = posix_io.driver() });
+    var rt = try Runtime.init(testing.allocator, .{ .worker_count = 1, .io = posix_io.driver() });
     defer rt.deinit();
 
     const writer = try rt.spawn(Writer{});
@@ -614,7 +618,7 @@ test "posix io driver parks socket reads until another actor writes" {
     var posix_io = DefaultIo.init();
     defer posix_io.deinit();
 
-    var rt = try Runtime.init(testing.allocator, .{ .io = posix_io.driver() });
+    var rt = try Runtime.init(testing.allocator, .{ .worker_count = 1, .io = posix_io.driver() });
     defer rt.deinit();
 
     var out: [4]u8 = undefined;
@@ -712,7 +716,7 @@ test "posix io driver parks socket writes until peer reads" {
     var posix_io = DefaultIo.init();
     defer posix_io.deinit();
 
-    var rt = try Runtime.init(testing.allocator, .{ .io = posix_io.driver() });
+    var rt = try Runtime.init(testing.allocator, .{ .worker_count = 1, .io = posix_io.driver() });
     defer rt.deinit();
 
     var saw_marker = false;

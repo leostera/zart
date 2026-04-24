@@ -24,7 +24,7 @@ test "raw send rejects wrong message type" {
         }
     };
 
-    var rt = try Runtime.init(testing.allocator, .{});
+    var rt = try Runtime.init(testing.allocator, .{ .worker_count = 1 });
     defer rt.deinit();
 
     const stopped = try rt.spawn(StopActor{});
@@ -51,7 +51,7 @@ test "actor failure destroys actor and invalidates handle" {
         }
     };
 
-    var rt = try Runtime.init(testing.allocator, .{});
+    var rt = try Runtime.init(testing.allocator, .{ .worker_count = 1 });
     defer rt.deinit();
 
     const failing = try rt.spawn(FailingActor{});
@@ -78,7 +78,7 @@ test "completed actors release their registry slot" {
         }
     };
 
-    var rt = try Runtime.init(testing.allocator, .{});
+    var rt = try Runtime.init(testing.allocator, .{ .worker_count = 1 });
     defer rt.deinit();
 
     const first = try rt.spawn(StopActor{});
@@ -112,7 +112,7 @@ test "failed spawn releases reserved actor id" {
         }
     };
 
-    var rt = try Runtime.init(testing.allocator, .{ .stack_size = 1 });
+    var rt = try Runtime.init(testing.allocator, .{ .worker_count = 1, .stack_size = 1 });
     defer rt.deinit();
 
     try testing.expectError(error.StackTooSmall, rt.spawn(StopActor{}));

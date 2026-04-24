@@ -38,7 +38,7 @@ test "smp run completes many actors across workers" {
         try worker.send(.run);
     }
 
-    try rt.runSmp();
+    try rt.run();
 
     try testing.expectEqual(@as(usize, ActorCount), completed.load(.acquire));
 }
@@ -103,7 +103,7 @@ test "smp randomized counter routing matches reference counts" {
         }
         for (counters) |counter| try counter.send(.stop);
 
-        try rt.runSmp();
+        try rt.run();
 
         try testing.expectEqualSlices(usize, &expected, &observed);
     }
