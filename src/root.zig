@@ -25,4 +25,5 @@ test {
     _ = io;
     _ = Fiber;
     _ = testing;
+    _ = @import("runtime/parker.zig");
 }
