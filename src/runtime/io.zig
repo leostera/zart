@@ -34,6 +34,7 @@ pub const RuntimeIo = struct {
 
     pub const Request = struct {
         next: ?*Request = null,
+        completion_next: ?*Request = null,
         actor: *anyopaque,
         complete_context: ?*anyopaque = null,
         complete_fn: ?*const fn (?*anyopaque, *Request) void = null,
@@ -256,24 +257,9 @@ pub const RuntimeIo = struct {
 
     const Shared = struct {
         driver: ?Driver,
-        lock: SpinLock = .{},
-        completions_head: ?*Request = null,
-        completions_tail: ?*Request = null,
-        pending_count: usize = 0,
-    };
-
-    const SpinLock = struct {
-        locked: std.atomic.Value(bool) = .init(false),
-
-        fn lock(spin: *SpinLock) void {
-            while (spin.locked.cmpxchgWeak(false, true, .acquire, .monotonic)) |_| {
-                while (spin.locked.load(.monotonic)) std.atomic.spinLoopHint();
-            }
-        }
-
-        fn unlock(spin: *SpinLock) void {
-            spin.locked.store(false, .release);
-        }
+        completions_incoming: std.atomic.Value(?*Request) = .init(null),
+        completions_local: ?*Request = null,
+        pending_count: std.atomic.Value(usize) = .init(0),
     };
 
     pub fn init(allocator: std.mem.Allocator, driver: ?Driver) InitError!RuntimeIo {
@@ -290,7 +276,7 @@ pub const RuntimeIo = struct {
     pub fn deinit(runtime_io: *RuntimeIo, allocator: std.mem.Allocator) void {
         const shared = runtime_io.shared;
         discardCompletions(shared);
-        std.debug.assert(shared.pending_count == 0);
+        std.debug.assert(shared.pending_count.load(.acquire) == 0);
         allocator.destroy(shared);
         runtime_io.* = undefined;
     }
@@ -308,15 +294,12 @@ pub const RuntimeIo = struct {
         const shared = runtime_io.shared;
         const driver = shared.driver orelse @panic("actor I/O submitted without an I/O driver");
 
-        {
-            shared.lock.lock();
-            defer shared.lock.unlock();
-            shared.pending_count += 1;
-        }
         request.next = null;
+        request.completion_next = null;
         request.complete_context = shared;
         request.complete_fn = completeRequest;
         request.completed.store(false, .monotonic);
+        _ = shared.pending_count.fetchAdd(1, .release);
 
         driver.submit(request);
     }
@@ -332,52 +315,111 @@ pub const RuntimeIo = struct {
     }
 
     pub fn popCompletion(runtime_io: *RuntimeIo) ?*Request {
-        const shared = runtime_io.shared;
-
-        shared.lock.lock();
-        defer shared.lock.unlock();
-
-        const request = shared.completions_head orelse return null;
-        shared.completions_head = request.next;
-        if (shared.completions_head == null) shared.completions_tail = null;
-        request.next = null;
-        shared.pending_count -= 1;
-        return request;
+        return popSharedCompletion(runtime_io.shared);
     }
 
     pub fn hasPending(runtime_io: *RuntimeIo) bool {
-        const shared = runtime_io.shared;
-
-        shared.lock.lock();
-        defer shared.lock.unlock();
-
-        return shared.pending_count != 0;
+        return runtime_io.shared.pending_count.load(.acquire) != 0;
     }
 
     fn completeRequest(context: ?*anyopaque, request: *Request) void {
         const shared: *Shared = @ptrCast(@alignCast(context.?));
-        shared.lock.lock();
-        defer shared.lock.unlock();
 
         request.completed.store(true, .release);
-        request.next = null;
-        if (shared.completions_tail) |tail| {
-            tail.next = request;
-        } else {
-            shared.completions_head = request;
+        var head = shared.completions_incoming.load(.monotonic);
+        while (true) {
+            request.completion_next = head;
+            head = shared.completions_incoming.cmpxchgWeak(head, request, .release, .monotonic) orelse return;
         }
-        shared.completions_tail = request;
+    }
+
+    fn popSharedCompletion(shared: *Shared) ?*Request {
+        if (shared.completions_local == null) refillLocalCompletions(shared);
+
+        const request = shared.completions_local orelse return null;
+        shared.completions_local = request.completion_next;
+        request.completion_next = null;
+        _ = shared.pending_count.fetchSub(1, .acq_rel);
+        return request;
+    }
+
+    fn refillLocalCompletions(shared: *Shared) void {
+        var stack = shared.completions_incoming.swap(null, .acquire);
+        var reversed: ?*Request = null;
+        while (stack) |request| {
+            stack = request.completion_next;
+            request.completion_next = reversed;
+            reversed = request;
+        }
+        shared.completions_local = reversed;
     }
 
     fn discardCompletions(shared: *Shared) void {
-        while (shared.completions_head) |request| {
-            shared.completions_head = request.next;
-            request.next = null;
-            shared.pending_count -= 1;
-        }
-        shared.completions_tail = null;
+        while (popSharedCompletion(shared)) |_| {}
     }
 };
+
+test "runtime io completion queue accepts concurrent producers" {
+    const testing = std.testing;
+
+    const ProducerCount = 4;
+    const PerProducer = 256;
+    const Total = ProducerCount * PerProducer;
+
+    const ImmediateDriver = struct {
+        fn driver() RuntimeIo.Driver {
+            return .{ .submit_fn = submit };
+        }
+
+        fn submit(_: ?*anyopaque, request: *RuntimeIo.Request) void {
+            request.completeSleep({});
+        }
+    };
+
+    const Producer = struct {
+        runtime_io: *RuntimeIo,
+        requests: []RuntimeIo.Request,
+        actors: []u8,
+
+        fn run(self: @This()) void {
+            for (self.requests, 0..) |*request, index| {
+                request.* = .initSleep(&self.actors[index], .none);
+                self.runtime_io.submit(request);
+            }
+        }
+    };
+
+    var runtime_io = try RuntimeIo.init(testing.allocator, ImmediateDriver.driver());
+    defer runtime_io.deinit(testing.allocator);
+
+    var requests: [Total]RuntimeIo.Request = undefined;
+    var actors: [Total]u8 = undefined;
+    var threads: [ProducerCount]std.Thread = undefined;
+
+    for (&threads, 0..) |*thread, producer| {
+        const start = producer * PerProducer;
+        thread.* = try std.Thread.spawn(.{}, Producer.run, .{Producer{
+            .runtime_io = &runtime_io,
+            .requests = requests[start..][0..PerProducer],
+            .actors = actors[start..][0..PerProducer],
+        }});
+    }
+    for (threads) |thread| thread.join();
+
+    var seen = [_]bool{false} ** Total;
+    var count: usize = 0;
+    while (runtime_io.popCompletion()) |request| {
+        const index = @intFromPtr(request.actor) - @intFromPtr(&actors[0]);
+        try testing.expect(index < Total);
+        try testing.expect(!seen[index]);
+        seen[index] = true;
+        count += 1;
+    }
+
+    try testing.expectEqual(@as(usize, Total), count);
+    try testing.expect(!runtime_io.hasPending());
+    for (seen) |item_seen| try testing.expect(item_seen);
+}
 
 pub const ActorIoContext = struct {
     runtime_io: *RuntimeIo,
