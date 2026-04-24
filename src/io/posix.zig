@@ -22,6 +22,7 @@ pub const Posix = struct {
     mutex: std.Io.Mutex = .init,
     pending_head: ?*RuntimeIo.Request = null,
     pending_tail: ?*RuntimeIo.Request = null,
+    pending_count: usize = 0,
     wake_read: posix.fd_t,
     wake_write: posix.fd_t,
 
@@ -36,7 +37,9 @@ pub const Posix = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        std.debug.assert(self.pending_head == null);
+        if (self.pending_count != 0 or self.pending_head != null or self.pending_tail != null) {
+            @panic("Posix I/O driver deinit called with pending requests");
+        }
         closeFd(self.wake_read);
         closeFd(self.wake_write);
         self.* = undefined;
@@ -55,6 +58,7 @@ pub const Posix = struct {
         if (self.tryComplete(request)) return;
 
         self.mutex.lockUncancelable(std.Options.debug_io);
+        if (std.debug.runtime_safety) self.assertNotPending(request);
         self.enqueue(request);
         self.mutex.unlock(std.Options.debug_io);
         self.wakePoller();
@@ -94,6 +98,7 @@ pub const Posix = struct {
             self.pending_head = request;
         }
         self.pending_tail = request;
+        self.pending_count += 1;
     }
 
     fn fillPollfds(self: *Self, buffer: []posix.pollfd) []posix.pollfd {
@@ -141,6 +146,7 @@ pub const Posix = struct {
                 }
                 if (self.pending_tail == request) self.pending_tail = previous;
                 request.next = null;
+                self.pending_count -= 1;
                 completed_any = true;
             } else {
                 previous = request;
@@ -149,7 +155,28 @@ pub const Posix = struct {
             current = next;
         }
 
+        if (std.debug.runtime_safety) self.assertPendingCountConsistent();
         return completed_any;
+    }
+
+    fn assertNotPending(self: *const Self, request: *const RuntimeIo.Request) void {
+        var node = self.pending_head;
+        while (node) |current| : (node = current.next) {
+            if (current == request) @panic("POSIX I/O request submitted while already pending");
+        }
+    }
+
+    fn assertPendingCountConsistent(self: *const Self) void {
+        var count: usize = 0;
+        var node = self.pending_head;
+        var last: ?*RuntimeIo.Request = null;
+        while (node) |current| : (node = current.next) {
+            count += 1;
+            last = current;
+        }
+        if (count != self.pending_count or last != self.pending_tail) {
+            @panic("POSIX I/O pending queue corrupted");
+        }
     }
 
     fn wakePoller(self: *Self) void {

@@ -351,7 +351,9 @@ pub const RuntimeIo = struct {
     fn completeRequest(context: ?*anyopaque, request: *Request) void {
         const shared: *Shared = @ptrCast(@alignCast(context.?));
 
-        request.completed.store(true, .release);
+        if (request.completed.swap(true, .acq_rel)) {
+            @panic("I/O request completed more than once");
+        }
         var head = shared.completions_incoming.load(.monotonic);
         while (true) {
             request.completion_next = head;
