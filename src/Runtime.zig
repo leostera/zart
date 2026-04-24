@@ -133,6 +133,7 @@ pub const Runtime = struct {
     io: RuntimeIo,
     stacks: []StackPool,
     actors: Registry,
+    retired_mutex: std.Io.Mutex,
     retired: RetiredActors,
     workers: []Worker,
     next_external_spawn_worker: std.atomic.Value(usize),
@@ -170,6 +171,7 @@ pub const Runtime = struct {
             .io = runtime_io,
             .stacks = stacks,
             .actors = .{},
+            .retired_mutex = .init,
             .retired = .{},
             .workers = workers,
             .next_external_spawn_worker = .init(0),
@@ -254,6 +256,66 @@ pub const Runtime = struct {
         }
     }
 
+    /// Runs configured workers on OS threads and waits for all workers to stop.
+    ///
+    /// This is the first SMP run mode. Idle parking, work stealing, and
+    /// per-worker I/O completion routing are layered on top in later slices.
+    pub fn runSmp(rt: *Runtime) !void {
+        try rt.enterRun();
+        defer rt.leaveRun();
+
+        if (rt.workers.len == 1) return rt.runSmpWorker(0);
+
+        const ThreadContext = struct {
+            runtime: *Runtime,
+            worker_index: usize,
+            err: ?anyerror = null,
+
+            fn run(context: *@This()) void {
+                context.runtime.runSmpWorker(context.worker_index) catch |err| {
+                    context.err = err;
+                    context.runtime.stop();
+                };
+            }
+        };
+
+        const other_worker_count = rt.workers.len - 1;
+        const contexts = try rt.internal_allocator.alloc(ThreadContext, other_worker_count);
+        defer rt.internal_allocator.free(contexts);
+        const threads = try rt.internal_allocator.alloc(std.Thread, other_worker_count);
+        defer rt.internal_allocator.free(threads);
+
+        for (contexts, 0..) |*context, offset| {
+            context.* = .{
+                .runtime = rt,
+                .worker_index = offset + 1,
+            };
+        }
+
+        var spawned: usize = 0;
+        errdefer {
+            rt.stop();
+            for (threads[0..spawned]) |thread| thread.join();
+        }
+        for (threads, contexts) |*thread, *context| {
+            thread.* = try std.Thread.spawn(.{}, ThreadContext.run, .{context});
+            spawned += 1;
+        }
+
+        var main_err: ?anyerror = null;
+        rt.runSmpWorker(0) catch |err| {
+            rt.stop();
+            main_err = err;
+        };
+
+        for (threads) |thread| thread.join();
+
+        if (main_err) |err| return err;
+        for (contexts) |context| {
+            if (context.err) |err| return err;
+        }
+    }
+
     fn enterRun(rt: *Runtime) !void {
         while (true) {
             switch (rt.lifecycle.load(.acquire)) {
@@ -291,6 +353,19 @@ pub const Runtime = struct {
 
     fn closeWorkers(rt: *Runtime) void {
         for (rt.workers) |*target_worker| target_worker.close(rt.options.scheduler_io);
+    }
+
+    fn runSmpWorker(rt: *Runtime, worker_index: usize) !void {
+        const current_worker = &rt.workers[worker_index];
+
+        while (!rt.isStopping()) {
+            if (worker_index == 0) {
+                try rt.pollIo(.nonblocking);
+                rt.drainIoCompletions();
+            }
+
+            if (!try rt.runReadyActor(current_worker)) return;
+        }
     }
 
     fn runReadyActor(rt: *Runtime, current_worker: *Worker) !bool {
@@ -487,10 +562,14 @@ pub const Runtime = struct {
 
     fn destroyActor(rt: *Runtime, target: *ActorHeader) void {
         rt.actors.remove(rt.options.scheduler_io, target);
+        rt.retired_mutex.lockUncancelable(rt.options.scheduler_io);
+        defer rt.retired_mutex.unlock(rt.options.scheduler_io);
         rt.retired.retire(target);
     }
 
     fn reclaimRetiredActors(rt: *Runtime) void {
+        rt.retired_mutex.lockUncancelable(rt.options.scheduler_io);
+        defer rt.retired_mutex.unlock(rt.options.scheduler_io);
         rt.retired.drain(rt);
     }
 
@@ -949,4 +1028,40 @@ test "runtime stop exits after current actor turn" {
     try testing.expect(!observer_ran);
     try testing.expectEqual(Runtime.State.stopped, rt.state());
     try testing.expectError(error.RuntimeStopped, observer.send(.run));
+}
+
+test "runtime smp run executes actors on configured workers" {
+    const testing = std.testing;
+
+    const RunMsg = union(enum) {
+        run,
+    };
+
+    const WorkerActor = struct {
+        pub const Msg = RunMsg;
+
+        completed: *std.atomic.Value(usize),
+
+        pub fn run(self: *@This(), ctx: *Ctx(RunMsg)) !void {
+            _ = try ctx.recv();
+            _ = self.completed.fetchAdd(1, .acq_rel);
+        }
+    };
+
+    var rt = try Runtime.init(testing.allocator, .{
+        .worker_count = 2,
+        .preallocate_stack_slab = false,
+    });
+    defer rt.deinit();
+
+    var completed = std.atomic.Value(usize).init(0);
+    const first = try rt.spawn(WorkerActor{ .completed = &completed });
+    const second = try rt.spawn(WorkerActor{ .completed = &completed });
+
+    try first.send(.run);
+    try second.send(.run);
+    try rt.runSmp();
+
+    try testing.expectEqual(@as(usize, 2), completed.load(.acquire));
+    try testing.expectEqual(Runtime.State.idle, rt.state());
 }
