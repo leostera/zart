@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const Fiber = @import("Fiber.zig");
 const actor = @import("runtime/actor.zig");
@@ -103,6 +104,16 @@ threadlocal var current_actor_header: ?*ActorHeader = null;
 /// the runtime has no runnable actors or evented pending I/O.
 pub const Runtime = struct {
     pub const State = RuntimeState;
+    pub const InvariantError = error{
+        ActiveActorsAtRest,
+        CompletedActorInRegistry,
+        FailedActorInRegistry,
+        InvalidQueuedActor,
+        InvalidRunnableCount,
+        InvalidWaitReason,
+        QueuedWaitingActor,
+        WorkerHasCurrentActorAtRest,
+    };
 
     pub const Options = struct {
         /// Stack bytes allocated for each actor fiber.
@@ -125,6 +136,8 @@ pub const Runtime = struct {
         tracer: ?Tracer = null,
         /// Optional non-blocking I/O driver used by `ctx.io()`.
         io: ?IoDriver = null,
+        /// Enables rest-state invariant checks after normal `run()` returns.
+        validate_invariants: bool = builtin.mode == .Debug,
     };
 
     allocator: Allocator,
@@ -250,7 +263,11 @@ pub const Runtime = struct {
         rt.io.setCompletionNotify(rt, notifyIoCompletion);
         rt.smp_quiescing.store(false, .release);
 
-        if (rt.workers.len == 1) return rt.runSmpWorker(0);
+        if (rt.workers.len == 1) {
+            try rt.runSmpWorker(0);
+            try rt.validateRestInvariants();
+            return;
+        }
 
         const ThreadContext = struct {
             runtime: *Runtime,
@@ -301,6 +318,7 @@ pub const Runtime = struct {
         for (contexts) |context| {
             if (context.err) |err| return err;
         }
+        try rt.validateRestInvariants();
     }
 
     fn enterRun(rt: *Runtime) !void {
@@ -738,6 +756,50 @@ pub const Runtime = struct {
         defer rt.trace_mutex.unlock(rt.options.scheduler_io);
 
         tracer.record(event);
+    }
+
+    fn validateRestInvariants(rt: *Runtime) InvariantError!void {
+        if (!rt.options.validate_invariants) return;
+
+        if (rt.active_worker_count.load(.acquire) != 0) return error.ActiveActorsAtRest;
+        for (rt.workers) |*runtime_worker| {
+            if (runtime_worker.currentActor() != null) return error.WorkerHasCurrentActorAtRest;
+        }
+
+        const Visitor = struct {
+            queued_count: usize = 0,
+
+            pub fn visit(visitor: *@This(), actor_header: *ActorHeader) InvariantError!void {
+                const actor_state = actor_header.loadState();
+                const wait_reason = actor_header.loadWaitReason();
+                const queued = actor_header.queued.load(.acquire);
+
+                switch (actor_state) {
+                    .runnable => {
+                        if (wait_reason != .none) return error.InvalidWaitReason;
+                    },
+                    .running => return error.ActiveActorsAtRest,
+                    .waiting => {
+                        if (queued) return error.QueuedWaitingActor;
+                        switch (wait_reason) {
+                            .recv, .io => {},
+                            .none => return error.InvalidWaitReason,
+                        }
+                    },
+                    .completed => return error.CompletedActorInRegistry,
+                    .failed => return error.FailedActorInRegistry,
+                }
+
+                if (queued) {
+                    if (actor_state != .runnable) return error.InvalidQueuedActor;
+                    visitor.queued_count += 1;
+                }
+            }
+        };
+
+        var visitor: Visitor = .{};
+        try rt.actors.forEachActor(rt.options.scheduler_io, &visitor);
+        if (rt.runnable_count.load(.acquire) != visitor.queued_count) return error.InvalidRunnableCount;
     }
 };
 

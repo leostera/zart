@@ -103,6 +103,18 @@ pub fn Registry(comptime ActorHeader: type) type {
             return actor;
         }
 
+        pub fn forEachActor(registry: *Self, sync_io: std.Io, visitor: anytype) !void {
+            registry.mutex.lockUncancelable(sync_io);
+            defer registry.mutex.unlock(sync_io);
+
+            var slab = registry.slabs.load(.acquire);
+            while (slab) |current| : (slab = current.next) {
+                for (current.slots) |*slot| {
+                    if (slot.actor.load(.acquire)) |actor| try visitor.visit(actor);
+                }
+            }
+        }
+
         pub fn destroy(registry: *Self, sync_io: std.Io, runtime: anytype, actor: *ActorHeader) void {
             registry.remove(sync_io, actor);
             actor.destroy_fn(runtime, actor);
