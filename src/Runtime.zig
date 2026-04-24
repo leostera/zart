@@ -727,6 +727,10 @@ pub const Runtime = struct {
     fn endActorTurn(rt: *Runtime) void {
         const previous = rt.active_worker_count.fetchSub(1, .acq_rel);
         if (previous == 0) @panic("active actor count underflow");
+        if (previous == 1) {
+            rt.io.wakePoller();
+            rt.workers[0].notify(rt.options.scheduler_io);
+        }
     }
 
     fn anyQueuedActors(rt: *Runtime) bool {
