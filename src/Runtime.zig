@@ -312,8 +312,8 @@ pub const Runtime = struct {
         const stack = try owner_stack_pool.alloc();
         errdefer owner_stack_pool.free(stack);
 
-        const actor_id = try rt.actors.reserve(rt.internal_allocator);
-        errdefer rt.actors.cancelReserve(actor_id);
+        const actor_id = try rt.actors.reserve(rt.internal_allocator, rt.options.scheduler_io);
+        errdefer rt.actors.cancelReserve(rt.options.scheduler_io, actor_id);
 
         cell.* = Cell.init(rt, actor_id, owner_worker, stack, actor_value);
         cell.header.fiber = try Fiber.init(stack, Cell.fiberEntry, cell);
@@ -414,7 +414,7 @@ pub const Runtime = struct {
     }
 
     fn destroyActor(rt: *Runtime, target: *ActorHeader) void {
-        rt.actors.remove(target);
+        rt.actors.remove(rt.options.scheduler_io, target);
         rt.retired.retire(target);
     }
 

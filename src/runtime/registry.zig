@@ -8,6 +8,7 @@ const ActorId = trace.ActorId;
 
 pub fn Registry(comptime ActorHeader: type) type {
     return struct {
+        mutex: std.Io.Mutex = .init,
         slabs: std.atomic.Value(?*Slab) = .init(null),
         slot_count: std.atomic.Value(usize) = .init(0),
         next_index: usize = 0,
@@ -44,7 +45,10 @@ pub fn Registry(comptime ActorHeader: type) type {
             registry.* = undefined;
         }
 
-        pub fn reserve(registry: *Self, allocator: Allocator) !ActorId {
+        pub fn reserve(registry: *Self, allocator: Allocator, sync_io: std.Io) !ActorId {
+            registry.mutex.lockUncancelable(sync_io);
+            defer registry.mutex.unlock(sync_io);
+
             if (registry.first_free) |index| {
                 const slot = registry.slotAt(index) orelse unreachable;
                 std.debug.assert(slot.actor.load(.acquire) == null);
@@ -69,7 +73,10 @@ pub fn Registry(comptime ActorHeader: type) type {
             };
         }
 
-        pub fn cancelReserve(registry: *Self, actor_id: ActorId) void {
+        pub fn cancelReserve(registry: *Self, sync_io: std.Io, actor_id: ActorId) void {
+            registry.mutex.lockUncancelable(sync_io);
+            defer registry.mutex.unlock(sync_io);
+
             const slot = registry.slotAt(actor_id.index) orelse unreachable;
             std.debug.assert(slot.actor.load(.acquire) == null);
             std.debug.assert(slot.generation.load(.acquire) == actor_id.generation);
@@ -96,12 +103,15 @@ pub fn Registry(comptime ActorHeader: type) type {
             return actor;
         }
 
-        pub fn destroy(registry: *Self, runtime: anytype, actor: *ActorHeader) void {
-            registry.remove(actor);
+        pub fn destroy(registry: *Self, sync_io: std.Io, runtime: anytype, actor: *ActorHeader) void {
+            registry.remove(sync_io, actor);
             actor.destroy_fn(runtime, actor);
         }
 
-        pub fn remove(registry: *Self, actor: *ActorHeader) void {
+        pub fn remove(registry: *Self, sync_io: std.Io, actor: *ActorHeader) void {
+            registry.mutex.lockUncancelable(sync_io);
+            defer registry.mutex.unlock(sync_io);
+
             const index = actor.id.index;
             const slot = registry.slotAt(index) orelse unreachable;
             std.debug.assert(slot.actor.load(.acquire) == actor);
@@ -164,15 +174,15 @@ test "registry rejects stale ids after slot reuse" {
     var cleanup_count: usize = 0;
     defer registry.deinit(testing.allocator, &cleanup_count);
 
-    const first_id = try registry.reserve(testing.allocator);
+    const first_id = try registry.reserve(testing.allocator, testing.io);
     var first: Header = .{ .id = first_id };
     registry.publish(&first);
     try testing.expectEqual(@as(?*Header, &first), registry.get(first_id));
 
-    registry.remove(&first);
+    registry.remove(testing.io, &first);
     try testing.expectEqual(@as(?*Header, null), registry.get(first_id));
 
-    const second_id = try registry.reserve(testing.allocator);
+    const second_id = try registry.reserve(testing.allocator, testing.io);
     try testing.expectEqual(first_id.index, second_id.index);
     try testing.expect(first_id.generation != second_id.generation);
 
@@ -182,6 +192,66 @@ test "registry rejects stale ids after slot reuse" {
     try testing.expectEqual(@as(?*Header, &second), registry.get(second_id));
 
     var destroyed: usize = 0;
-    registry.destroy(&destroyed, &second);
+    registry.destroy(testing.io, &destroyed, &second);
     try testing.expectEqual(@as(usize, 1), destroyed);
+}
+
+test "registry reserves unique ids across concurrent callers" {
+    const testing = std.testing;
+
+    const ThreadCount = 4;
+    const PerThread = 128;
+    const Total = ThreadCount * PerThread;
+
+    const Header = struct {
+        id: ActorId,
+        destroy_fn: *const fn (*usize, *@This()) void = destroy,
+
+        fn destroy(count: *usize, _: *@This()) void {
+            count.* += 1;
+        }
+    };
+
+    const Producer = struct {
+        registry: *Registry(Header),
+        ids: []ActorId,
+        failed: *std.atomic.Value(bool),
+
+        fn run(self: @This()) void {
+            for (self.ids) |*id| {
+                id.* = self.registry.reserve(testing.allocator, testing.io) catch {
+                    self.failed.store(true, .release);
+                    return;
+                };
+            }
+        }
+    };
+
+    var registry: Registry(Header) = .{};
+    var cleanup_count: usize = 0;
+    defer registry.deinit(testing.allocator, &cleanup_count);
+
+    var ids: [Total]ActorId = undefined;
+    var failed = std.atomic.Value(bool).init(false);
+    var threads: [ThreadCount]std.Thread = undefined;
+
+    for (&threads, 0..) |*thread, producer| {
+        const start = producer * PerThread;
+        thread.* = try std.Thread.spawn(.{}, Producer.run, .{Producer{
+            .registry = &registry,
+            .ids = ids[start..][0..PerThread],
+            .failed = &failed,
+        }});
+    }
+    for (threads) |thread| thread.join();
+
+    try testing.expect(!failed.load(.acquire));
+
+    var seen = [_]bool{false} ** Total;
+    for (ids) |id| {
+        try testing.expect(id.index < Total);
+        try testing.expect(!seen[id.index]);
+        seen[id.index] = true;
+    }
+    for (seen) |item_seen| try testing.expect(item_seen);
 }
