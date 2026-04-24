@@ -114,7 +114,7 @@ pub const Runtime = struct {
     internal_allocator: Allocator,
     options: Options,
     io: RuntimeIo,
-    stacks: StackPool,
+    stacks: []StackPool,
     actors: Registry,
     retired: RetiredActors,
     workers: []Worker,
@@ -125,15 +125,23 @@ pub const Runtime = struct {
         var runtime_io = try RuntimeIo.init(internal_allocator, options.io);
         errdefer runtime_io.deinit(internal_allocator);
 
-        var stacks = StackPool.init(internal_allocator, options.stack_size, options.stack_slab_size);
-        errdefer stacks.deinit();
-        if (options.preallocate_stack_slab) try stacks.preallocateSlab();
-
         const worker_count = @max(options.worker_count, 1);
         const workers = try internal_allocator.alloc(Worker, worker_count);
         errdefer internal_allocator.free(workers);
         for (workers, 0..) |*worker_slot, index| {
             worker_slot.* = .init(.{ .index = index });
+        }
+
+        const stacks = try internal_allocator.alloc(StackPool, worker_count);
+        errdefer internal_allocator.free(stacks);
+        var initialized_stack_pools: usize = 0;
+        errdefer {
+            for (stacks[0..initialized_stack_pools]) |*pool| pool.deinit();
+        }
+        for (stacks) |*pool| {
+            pool.* = StackPool.init(internal_allocator, options.stack_size, options.stack_slab_size);
+            initialized_stack_pools += 1;
+            if (options.preallocate_stack_slab) try pool.preallocateSlab();
         }
 
         return .{
@@ -152,7 +160,8 @@ pub const Runtime = struct {
     pub fn deinit(rt: *Runtime) void {
         rt.reclaimRetiredActors();
         rt.actors.deinit(rt.internal_allocator, rt);
-        rt.stacks.deinit();
+        for (rt.stacks) |*pool| pool.deinit();
+        rt.internal_allocator.free(rt.stacks);
         rt.io.deinit(rt.internal_allocator);
         rt.internal_allocator.free(rt.workers);
         rt.* = undefined;
@@ -256,17 +265,19 @@ pub const Runtime = struct {
 
     fn spawnCell(rt: *Runtime, comptime Msg: type, comptime Cell: type, actor_value: anytype) !Actor(Msg) {
         try rt.syncStackPoolPolicy();
+        const owner_worker = rt.spawnOwnerWorker();
 
         const cell = try rt.internal_allocator.create(Cell);
         errdefer rt.internal_allocator.destroy(cell);
 
-        const stack = try rt.stacks.alloc();
-        errdefer rt.stacks.free(stack);
+        const owner_stack_pool = rt.stackPool(owner_worker);
+        const stack = try owner_stack_pool.alloc();
+        errdefer owner_stack_pool.free(stack);
 
         const actor_id = try rt.actors.reserve(rt.internal_allocator);
         errdefer rt.actors.cancelReserve(actor_id);
 
-        cell.* = Cell.init(rt, actor_id, rt.spawnOwnerWorker(), stack, actor_value);
+        cell.* = Cell.init(rt, actor_id, owner_worker, stack, actor_value);
         cell.header.fiber = try Fiber.init(stack, Cell.fiberEntry, cell);
         errdefer cell.header.fiber.deinit();
 
@@ -281,12 +292,21 @@ pub const Runtime = struct {
     }
 
     fn syncStackPoolPolicy(rt: *Runtime) Allocator.Error!void {
-        if (rt.stacks.matchesPolicy(rt.options.stack_size, rt.options.stack_slab_size)) return;
+        var matches = true;
+        for (rt.stacks) |*pool| {
+            if (!pool.matchesPolicy(rt.options.stack_size, rt.options.stack_slab_size)) {
+                matches = false;
+                break;
+            }
+        }
+        if (matches) return;
 
-        std.debug.assert(rt.stacks.live_count == 0);
-        rt.stacks.deinit();
-        rt.stacks = .init(rt.internal_allocator, rt.options.stack_size, rt.options.stack_slab_size);
-        if (rt.options.preallocate_stack_slab) try rt.stacks.preallocateSlab();
+        for (rt.stacks) |*pool| {
+            std.debug.assert(pool.live_count == 0);
+            pool.deinit();
+            pool.* = .init(rt.internal_allocator, rt.options.stack_size, rt.options.stack_slab_size);
+            if (rt.options.preallocate_stack_slab) try pool.preallocateSlab();
+        }
     }
 
     fn primaryWorker(rt: *Runtime) *Worker {
@@ -295,6 +315,14 @@ pub const Runtime = struct {
 
     fn ownerWorker(rt: *Runtime, target: *const ActorHeader) *Worker {
         return &rt.workers[target.owner_worker];
+    }
+
+    fn stackPool(rt: *Runtime, owner_worker: usize) *StackPool {
+        return &rt.stacks[owner_worker];
+    }
+
+    fn actorStackPool(rt: *Runtime, target: *const ActorHeader) *StackPool {
+        return rt.stackPool(target.owner_worker);
     }
 
     fn spawnOwnerWorker(rt: *Runtime) usize {
@@ -602,7 +630,7 @@ fn FunctionActorCell(comptime Msg: type, comptime entry: anytype) type {
             const cell: *Self = @ptrCast(@alignCast(header));
             cell.inbox.deinit();
             cell.header.fiber.deinit();
-            rt.stacks.free(cell.header.stack);
+            rt.actorStackPool(&cell.header).free(cell.header.stack);
             rt.internal_allocator.destroy(cell);
         }
     };
@@ -665,7 +693,7 @@ fn StructActorCell(comptime Msg: type, comptime ActorType: type) type {
             const cell: *Self = @ptrCast(@alignCast(header));
             cell.inbox.deinit();
             cell.header.fiber.deinit();
-            rt.stacks.free(cell.header.stack);
+            rt.actorStackPool(&cell.header).free(cell.header.stack);
             rt.internal_allocator.destroy(cell);
         }
     };
@@ -684,4 +712,17 @@ fn TypeId(comptime T: type) type {
         const Type = T;
         var id: u8 = 0;
     };
+}
+
+test "runtime creates one stack pool per configured worker" {
+    const testing = std.testing;
+
+    var rt = try Runtime.init(testing.allocator, .{
+        .worker_count = 4,
+        .preallocate_stack_slab = false,
+    });
+    defer rt.deinit();
+
+    try testing.expectEqual(@as(usize, 4), rt.workers.len);
+    try testing.expectEqual(@as(usize, 4), rt.stacks.len);
 }
