@@ -163,11 +163,11 @@ pub const Runtime = struct {
     trace_mutex: std.Io.Mutex,
     retired: RetiredActors,
     workers: []Worker,
-    next_external_spawn_worker: std.atomic.Value(usize),
-    runnable_count: std.atomic.Value(usize),
-    active_worker_count: std.atomic.Value(usize),
-    smp_quiescing: std.atomic.Value(bool),
-    lifecycle: std.atomic.Value(RuntimeState),
+    next_external_spawn_worker: std.atomic.Value(usize) align(std.atomic.cache_line),
+    runnable_count: std.atomic.Value(usize) align(std.atomic.cache_line),
+    active_worker_count: std.atomic.Value(usize) align(std.atomic.cache_line),
+    smp_quiescing: std.atomic.Value(bool) align(std.atomic.cache_line),
+    lifecycle: std.atomic.Value(RuntimeState) align(std.atomic.cache_line),
 
     /// Creates a runtime. `allocator` is exposed to actors through `ctx.allocator()`.
     pub fn init(allocator: Allocator, options: Options) RuntimeIo.InitError!Runtime {
