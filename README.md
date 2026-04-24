@@ -131,6 +131,8 @@ Actors receive `ctx.allocator()` from the allocator passed to `Runtime.init`. Ru
 
 `worker_count = 0` uses the host logical CPU count. Set `worker_count = 1` for deterministic single-worker tests; the public execution API is still `rt.run()`.
 
+The detailed runtime contract is documented in `docs/runtime-semantics.md`.
+
 ## I/O
 
 Actor I/O is non-blocking by runtime contract. `ctx.io()` returns a `std.Io` facade that preserves standard I/O call shapes while routing operations through a user-provided `zart.IoDriver`.
