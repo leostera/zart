@@ -99,6 +99,10 @@ const ActorHeader = struct {
     fn storeWaitReason(header: *ActorHeader, reason: WaitReason) void {
         header.wait_reason.store(reason, .release);
     }
+
+    fn claimQueueSlot(header: *ActorHeader) bool {
+        return header.queued.cmpxchgStrong(false, true, .acq_rel, .acquire) == null;
+    }
 };
 
 threadlocal var current_actor_header: ?*ActorHeader = null;
@@ -410,7 +414,7 @@ pub const Runtime = struct {
             if (worker_index == 0) {
                 try rt.pollIo(.nonblocking);
                 rt.drainIoCompletions();
-                if (rt.io.hasPoller() and rt.io.hasPending() and !rt.hasRunnableActors() and !rt.hasActiveActors()) {
+                if (rt.io.hasPoller() and rt.io.hasPending() and !rt.anyQueuedActors() and !rt.hasActiveActors()) {
                     try rt.pollIo(.wait);
                     rt.drainIoCompletions();
                     continue;
@@ -419,6 +423,11 @@ pub const Runtime = struct {
 
             if (try rt.runReadyActor(current_worker)) continue;
             if (rt.tryQuiesceSmp()) return;
+            if (worker_index == 0 and rt.io.hasPoller() and rt.io.hasPending() and !rt.hasActiveActors()) {
+                try rt.pollIo(.wait);
+                rt.drainIoCompletions();
+                continue;
+            }
 
             switch (current_worker.wait(rt.options.scheduler_io)) {
                 .notified => {},
@@ -689,28 +698,25 @@ pub const Runtime = struct {
         _ = rt.runnable_count.fetchAdd(1, .acq_rel);
     }
 
-    fn noteRunnableQueueCanceled(rt: *Runtime) void {
-        const previous = rt.runnable_count.fetchSub(1, .acq_rel);
-        if (previous == 0) @panic("runnable actor count underflow");
-    }
-
     fn enqueueCounted(rt: *Runtime, owner: *Worker, target: *ActorHeader) bool {
+        if (!target.claimQueueSlot()) return false;
         rt.noteRunnableQueued();
-        if (owner.enqueue(rt.options.scheduler_io, target)) return true;
-        rt.noteRunnableQueueCanceled();
-        return false;
+        owner.enqueueClaimed(rt.options.scheduler_io, target);
+        return true;
     }
 
     fn injectCounted(rt: *Runtime, owner: *Worker, target: *ActorHeader) bool {
+        if (!target.claimQueueSlot()) return false;
         rt.noteRunnableQueued();
-        if (owner.inject(target)) return true;
-        rt.noteRunnableQueueCanceled();
-        return false;
+        owner.injectClaimed(target);
+        return true;
     }
 
     fn noteRunnableDequeued(rt: *Runtime) void {
-        const previous = rt.runnable_count.fetchSub(1, .acq_rel);
-        if (previous == 0) @panic("runnable actor count underflow");
+        var previous = rt.runnable_count.load(.acquire);
+        while (previous != 0) {
+            previous = rt.runnable_count.cmpxchgWeak(previous, previous - 1, .acq_rel, .acquire) orelse return;
+        }
     }
 
     fn beginActorTurn(rt: *Runtime) void {
@@ -723,8 +729,11 @@ pub const Runtime = struct {
         if (previous == 0) @panic("active actor count underflow");
     }
 
-    fn hasRunnableActors(rt: *Runtime) bool {
-        return rt.runnable_count.load(.acquire) != 0;
+    fn anyQueuedActors(rt: *Runtime) bool {
+        for (rt.workers) |*runtime_worker| {
+            if (runtime_worker.hasQueued(rt.options.scheduler_io)) return true;
+        }
+        return false;
     }
 
     fn hasActiveActors(rt: *Runtime) bool {
@@ -735,14 +744,15 @@ pub const Runtime = struct {
         rt.turn_mutex.lockUncancelable(rt.options.scheduler_io);
         defer rt.turn_mutex.unlock(rt.options.scheduler_io);
 
-        if (rt.hasRunnableActors()) return false;
+        if (rt.anyQueuedActors()) return false;
         if (rt.hasActiveActors()) return false;
         if (rt.io.hasCompletions(rt.options.scheduler_io)) return false;
         if (rt.io.hasPoller() and rt.io.hasPending()) return false;
-        if (rt.hasRunnableActors()) return false;
+        if (rt.anyQueuedActors()) return false;
         if (rt.hasActiveActors()) return false;
 
         if (rt.smp_quiescing.cmpxchgStrong(false, true, .acq_rel, .acquire) == null) {
+            rt.runnable_count.store(0, .release);
             for (rt.workers) |*target_worker| target_worker.notify(rt.options.scheduler_io);
         }
         return true;

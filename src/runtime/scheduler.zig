@@ -16,6 +16,11 @@ pub fn Scheduler(comptime ActorHeader: type) type {
 
         pub fn enqueue(scheduler: *Self, target: *ActorHeader) bool {
             if (target.queued.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return false;
+            scheduler.enqueueClaimed(target);
+            return true;
+        }
+
+        pub fn enqueueClaimed(scheduler: *Self, target: *ActorHeader) void {
             target.next_run = null;
 
             if (scheduler.run_tail) |tail| {
@@ -24,7 +29,6 @@ pub fn Scheduler(comptime ActorHeader: type) type {
                 scheduler.run_head = target;
             }
             scheduler.run_tail = target;
-            return true;
         }
 
         pub fn dequeue(scheduler: *Self) ?*ActorHeader {
@@ -35,6 +39,10 @@ pub fn Scheduler(comptime ActorHeader: type) type {
             target.next_run = null;
             target.queued.store(false, .release);
             return target;
+        }
+
+        pub fn hasQueued(scheduler: *const Self) bool {
+            return scheduler.run_head != null;
         }
 
         pub fn setCurrent(scheduler: *Self, actor: ?*ActorHeader) void {

@@ -34,10 +34,21 @@ pub fn Worker(comptime ActorHeader: type) type {
             return worker.scheduler.enqueue(actor);
         }
 
+        pub fn enqueueClaimed(worker: *Self, io: std.Io, actor: *ActorHeader) void {
+            worker.scheduler_mutex.lockUncancelable(io);
+            defer worker.scheduler_mutex.unlock(io);
+
+            worker.scheduler.enqueueClaimed(actor);
+        }
+
         pub fn inject(worker: *Self, actor: *ActorHeader) bool {
             if (actor.queued.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return false;
-            worker.injections.push(actor);
+            worker.injectClaimed(actor);
             return true;
+        }
+
+        pub fn injectClaimed(worker: *Self, actor: *ActorHeader) void {
+            worker.injections.push(actor);
         }
 
         pub fn injectAndNotify(worker: *Self, io: std.Io, actor: *ActorHeader) void {
@@ -64,6 +75,13 @@ pub fn Worker(comptime ActorHeader: type) type {
             const actor = worker.scheduler.dequeue() orelse return null;
             _ = worker.steal_count.fetchAdd(1, .acq_rel);
             return actor;
+        }
+
+        pub fn hasQueued(worker: *Self, io: std.Io) bool {
+            worker.scheduler_mutex.lockUncancelable(io);
+            defer worker.scheduler_mutex.unlock(io);
+
+            return worker.scheduler.hasQueued() or worker.injections.hasPending();
         }
 
         pub fn setCurrent(worker: *Self, actor: ?*ActorHeader) void {

@@ -29,6 +29,10 @@ pub fn InjectionQueue(comptime ActorHeader: type) type {
             return actor;
         }
 
+        pub fn hasPending(queue: *const Self) bool {
+            return queue.local_head != null or queue.incoming.load(.acquire) != null;
+        }
+
         fn refillLocal(queue: *Self) void {
             var stack = queue.incoming.swap(null, .acquire);
             var reversed: ?*ActorHeader = null;
