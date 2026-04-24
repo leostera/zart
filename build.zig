@@ -141,6 +141,7 @@ pub fn build(b: *std.Build) void {
         "cooperative_yield",
         "tracing",
         "file_io",
+        "http_server",
     };
     const examples_step = b.step("examples", "Build all examples");
     for (example_names) |example_name| {
@@ -159,6 +160,9 @@ pub fn build(b: *std.Build) void {
 
         const example_step = b.step(b.fmt("example-{s}", .{example_name}), b.fmt("Run the {s} example", .{example_name}));
         const example_cmd = b.addRunArtifact(example_exe);
+        if (b.args) |args| {
+            example_cmd.addArgs(args);
+        }
         example_step.dependOn(&example_cmd.step);
     }
 

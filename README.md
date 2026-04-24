@@ -171,9 +171,23 @@ zig build example-fan_out
 zig build example-cooperative_yield
 zig build example-tracing
 zig build example-file_io
+zig build example-http_server
 ```
 
-They cover typed request/reply actors, ping-pong messaging, fan-out aggregation, explicit `ctx.yield()` checkpoints, runtime tracing, and `ctx.io()` file reads.
+They cover typed request/reply actors, ping-pong messaging, fan-out aggregation, explicit `ctx.yield()` checkpoints, runtime tracing, `ctx.io()` file reads, and one-actor-per-request HTTP socket handling.
+
+The HTTP server runs until interrupted by default:
+
+```sh
+zig build example-http_server -- --port 8080
+curl http://127.0.0.1:8080/hello
+```
+
+For smoke tests, limit the accept loop:
+
+```sh
+zig build example-http_server -- --port 8080 --max-requests 1
+```
 
 ## Build
 
