@@ -279,7 +279,9 @@ pub const RuntimeIo = struct {
     pub fn deinit(runtime_io: *RuntimeIo, allocator: std.mem.Allocator) void {
         const shared = runtime_io.shared;
         discardCompletions(shared);
-        std.debug.assert(shared.pending_count.load(.acquire) == 0);
+        if (shared.pending_count.load(.acquire) != 0) {
+            @panic("RuntimeIo.deinit called with pending actor I/O");
+        }
         allocator.destroy(shared);
         runtime_io.* = undefined;
     }

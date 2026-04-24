@@ -1,6 +1,7 @@
 comptime {
     _ = @import("runtime/failure_registry.zig");
     _ = @import("runtime/io.zig");
+    _ = @import("runtime/lifecycle.zig");
     _ = @import("runtime/properties.zig");
     _ = @import("runtime/scheduler.zig");
     _ = @import("runtime/smp.zig");

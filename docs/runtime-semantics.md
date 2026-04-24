@@ -135,6 +135,12 @@ Retired actors may be destroyed after a scheduler boundary. Runtime teardown
 must drain I/O completions before destroying actor stacks because stack-backed
 I/O request nodes can still be in the completion queue.
 
+`Runtime.deinit()` releases live actors that have not run and actors parked on
+`recv`. It is a runtime error to deinitialize while unresolved actor I/O is
+still pending, because the driver can still hold stack-backed request pointers.
+Call `rt.hasPendingIo()` when tearing down no-poller test drivers that may
+complete requests after `run()` returns.
+
 ## Tracing
 
 When configured, a tracer records actor lifecycle, scheduling, message, failure,

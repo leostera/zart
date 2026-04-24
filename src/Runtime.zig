@@ -257,6 +257,11 @@ pub const Runtime = struct {
         return rt.lifecycle.load(.acquire);
     }
 
+    /// Returns true when actor I/O has submitted requests not yet drained by the runtime.
+    pub fn hasPendingIo(rt: *Runtime) bool {
+        return rt.io.hasPending();
+    }
+
     /// Runs configured workers until no runnable actor or pending I/O remains, or an actor fails.
     pub fn run(rt: *Runtime) !void {
         try rt.enterRun();
