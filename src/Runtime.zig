@@ -577,3 +577,74 @@ test "struct actor counter" {
 
     try testing.expectEqual(@as(u64, 42), observed);
 }
+
+test "yield lets another runnable actor run" {
+    const testing = std.testing;
+
+    const Trace = struct {
+        items: [8]u8 = undefined,
+        len: usize = 0,
+
+        fn push(trace: *@This(), item: u8) void {
+            trace.items[trace.len] = item;
+            trace.len += 1;
+        }
+
+        fn slice(trace: *const @This()) []const u8 {
+            return trace.items[0..trace.len];
+        }
+    };
+
+    const OtherMsg = union(enum) {
+        hit,
+    };
+
+    const WorkerMsg = union(enum) {
+        start: Mailbox(OtherMsg),
+    };
+
+    const Actors = struct {
+        const Worker = struct {
+            pub const Msg = WorkerMsg;
+
+            trace: *Trace,
+
+            pub fn run(self: *@This(), ctx: *Ctx(Msg)) !void {
+                switch (try ctx.recv()) {
+                    .start => |other| {
+                        self.trace.push('a');
+                        try other.send(.hit);
+                        ctx.yield();
+                        self.trace.push('b');
+                        ctx.yield();
+                        self.trace.push('c');
+                    },
+                }
+            }
+        };
+
+        const Other = struct {
+            pub const Msg = OtherMsg;
+
+            trace: *Trace,
+
+            pub fn run(self: *@This(), ctx: *Ctx(Msg)) !void {
+                switch (try ctx.recv()) {
+                    .hit => self.trace.push('x'),
+                }
+            }
+        };
+    };
+
+    var rt = Runtime.init(testing.allocator, .{});
+    defer rt.deinit();
+
+    var trace: Trace = .{};
+    const other = try rt.spawn(Actors.Other{ .trace = &trace });
+    const worker = try rt.spawn(Actors.Worker{ .trace = &trace });
+
+    try worker.send(.{ .start = other });
+    try rt.run();
+
+    try testing.expectEqualStrings("axbc", trace.slice());
+}
