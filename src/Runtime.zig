@@ -452,15 +452,15 @@ pub const Runtime = struct {
             .suspended => switch (ready.loadState()) {
                 .running => {
                     ready.mustTransitionState(.running, .runnable);
-                    rt.enqueue(ready);
+                    rt.enqueueFromWorker(current_worker, ready);
                 },
                 .parking => {
                     if (!ready.transitionState(.parking, .waiting)) {
-                        if (ready.loadState() == .runnable) rt.enqueue(ready);
+                        if (ready.loadState() == .runnable) rt.enqueueFromWorker(current_worker, ready);
                     }
                 },
                 .runnable => {
-                    rt.enqueue(ready);
+                    rt.enqueueFromWorker(current_worker, ready);
                 },
                 .waiting => {},
                 .completed, .failed => unreachable,
@@ -639,6 +639,15 @@ pub const Runtime = struct {
             rt.noteRunnableQueued();
             owner.notify(rt.options.scheduler_io);
         }
+    }
+
+    fn enqueueFromWorker(rt: *Runtime, current_worker: *Worker, target: *ActorHeader) void {
+        if (current_worker.id.index == target.owner_worker) {
+            if (current_worker.enqueue(rt.options.scheduler_io, target)) rt.noteRunnableQueued();
+            return;
+        }
+
+        rt.enqueue(target);
     }
 
     fn enqueueSpawn(rt: *Runtime, target: *ActorHeader) void {
