@@ -574,7 +574,7 @@ pub const Runtime = struct {
         const owner = rt.ownerWorker(target);
         if (rt.currentActor()) |current| {
             if (current.owner_worker == target.owner_worker) {
-                if (owner.enqueue(target)) rt.noteRunnableQueued();
+                if (owner.enqueue(rt.options.scheduler_io, target)) rt.noteRunnableQueued();
                 return;
             }
         }
@@ -588,7 +588,7 @@ pub const Runtime = struct {
     fn enqueueSpawn(rt: *Runtime, target: *ActorHeader) void {
         const owner = rt.ownerWorker(target);
         if (rt.currentActor() != null or rt.state() != .running) {
-            if (owner.enqueue(target)) rt.noteRunnableQueued();
+            if (owner.enqueue(rt.options.scheduler_io, target)) rt.noteRunnableQueued();
             return;
         }
 
@@ -596,9 +596,17 @@ pub const Runtime = struct {
     }
 
     fn dequeue(rt: *Runtime, target_worker: *Worker) ?*ActorHeader {
-        const target = target_worker.dequeue() orelse return null;
+        const target = target_worker.dequeue(rt.options.scheduler_io) orelse rt.steal(target_worker) orelse return null;
         _ = rt.runnable_count.fetchSub(1, .acq_rel);
         return target;
+    }
+
+    fn steal(rt: *Runtime, target_worker: *Worker) ?*ActorHeader {
+        for (rt.workers) |*victim| {
+            if (victim == target_worker) continue;
+            if (victim.steal(rt.options.scheduler_io)) |stolen| return stolen;
+        }
+        return null;
     }
 
     fn noteRunnableQueued(rt: *Runtime) void {
@@ -1277,4 +1285,43 @@ test "runtime smp run wakes owner worker for async io completion" {
     completer.join();
 
     try testing.expect(completed.load(.acquire));
+}
+
+test "runtime workers can steal runnable actors" {
+    const testing = std.testing;
+
+    const StopMsg = union(enum) {
+        stop,
+    };
+
+    const Stopper = struct {
+        pub const Msg = StopMsg;
+
+        stopped: *bool,
+
+        pub fn run(self: *@This(), ctx: *Ctx(StopMsg)) !void {
+            _ = try ctx.recv();
+            self.stopped.* = true;
+        }
+    };
+
+    var rt = try Runtime.init(testing.allocator, .{
+        .worker_count = 2,
+        .preallocate_stack_slab = false,
+    });
+    defer rt.deinit();
+
+    rt.next_external_spawn_worker.store(0, .release);
+    var stopped = false;
+    const stopper = try rt.spawn(Stopper{ .stopped = &stopped });
+
+    const stolen = rt.dequeue(&rt.workers[1]) orelse return error.TestExpectedEqual;
+    try testing.expectEqual(stopper.any(), stolen.id);
+    try testing.expectEqual(@as(usize, 1), rt.workers[0].steal_count.load(.acquire));
+
+    rt.enqueue(stolen);
+    try stopper.send(.stop);
+    try rt.runSmp();
+
+    try testing.expect(stopped);
 }

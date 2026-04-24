@@ -12,9 +12,11 @@ pub const WorkerId = struct {
 pub fn Worker(comptime ActorHeader: type) type {
     return struct {
         id: WorkerId,
+        scheduler_mutex: std.Io.Mutex = .init,
         scheduler: Scheduler = .{},
         injections: InjectionQueue = .{},
         parker: parker.Parker = .{},
+        steal_count: std.atomic.Value(usize) = .init(0),
 
         const Self = @This();
         const InjectionQueue = injection_queue.InjectionQueue(ActorHeader);
@@ -24,7 +26,10 @@ pub fn Worker(comptime ActorHeader: type) type {
             return .{ .id = id };
         }
 
-        pub fn enqueue(worker: *Self, actor: *ActorHeader) bool {
+        pub fn enqueue(worker: *Self, io: std.Io, actor: *ActorHeader) bool {
+            worker.scheduler_mutex.lockUncancelable(io);
+            defer worker.scheduler_mutex.unlock(io);
+
             return worker.scheduler.enqueue(actor);
         }
 
@@ -38,10 +43,25 @@ pub fn Worker(comptime ActorHeader: type) type {
             if (worker.inject(actor)) worker.parker.notify(io);
         }
 
-        pub fn dequeue(worker: *Self) ?*ActorHeader {
-            if (worker.scheduler.dequeue()) |actor| return actor;
+        pub fn dequeue(worker: *Self, io: std.Io) ?*ActorHeader {
+            worker.scheduler_mutex.lockUncancelable(io);
+            if (worker.scheduler.dequeue()) |actor| {
+                worker.scheduler_mutex.unlock(io);
+                return actor;
+            }
+            worker.scheduler_mutex.unlock(io);
+
             const actor = worker.injections.pop() orelse return null;
             actor.queued.store(false, .release);
+            return actor;
+        }
+
+        pub fn steal(worker: *Self, io: std.Io) ?*ActorHeader {
+            worker.scheduler_mutex.lockUncancelable(io);
+            defer worker.scheduler_mutex.unlock(io);
+
+            const actor = worker.scheduler.dequeue() orelse return null;
+            _ = worker.steal_count.fetchAdd(1, .acq_rel);
             return actor;
         }
 
@@ -79,11 +99,11 @@ test "worker delegates local scheduling" {
     var worker = Worker(Header).init(.{ .index = 0 });
     var actor: Header = .{ .id = 1 };
 
-    try testing.expect(worker.enqueue(&actor));
+    try testing.expect(worker.enqueue(testing.io, &actor));
     worker.setCurrent(&actor);
 
     try testing.expectEqual(@as(?*Header, &actor), worker.currentActor());
-    try testing.expectEqual(@as(?*Header, &actor), worker.dequeue());
+    try testing.expectEqual(@as(?*Header, &actor), worker.dequeue(testing.io));
 }
 
 test "worker consumes remote injections after local queue" {
@@ -100,11 +120,29 @@ test "worker consumes remote injections after local queue" {
     var remote: Header = .{ .id = 2 };
 
     try testing.expect(worker.inject(&remote));
-    try testing.expect(worker.enqueue(&local));
+    try testing.expect(worker.enqueue(testing.io, &local));
 
-    try testing.expectEqual(@as(?*Header, &local), worker.dequeue());
-    try testing.expectEqual(@as(?*Header, &remote), worker.dequeue());
+    try testing.expectEqual(@as(?*Header, &local), worker.dequeue(testing.io));
+    try testing.expectEqual(@as(?*Header, &remote), worker.dequeue(testing.io));
     try testing.expect(!remote.queued.load(.acquire));
+}
+
+test "worker steals from another worker local queue" {
+    const testing = std.testing;
+
+    const Header = struct {
+        queued: std.atomic.Value(bool) = .init(false),
+        next_run: ?*@This() = null,
+        id: usize,
+    };
+
+    var victim = Worker(Header).init(.{ .index = 0 });
+    var actor: Header = .{ .id = 1 };
+
+    try testing.expect(victim.enqueue(testing.io, &actor));
+    try testing.expectEqual(@as(?*Header, &actor), victim.steal(testing.io));
+    try testing.expectEqual(@as(usize, 1), victim.steal_count.load(.acquire));
+    try testing.expect(!actor.queued.load(.acquire));
 }
 
 test "worker notifies parker for remote injections" {
@@ -122,5 +160,5 @@ test "worker notifies parker for remote injections" {
     worker.injectAndNotify(testing.io, &remote);
 
     try testing.expectEqual(parker.Parker.WaitResult.notified, worker.wait(testing.io));
-    try testing.expectEqual(@as(?*Header, &remote), worker.dequeue());
+    try testing.expectEqual(@as(?*Header, &remote), worker.dequeue(testing.io));
 }
