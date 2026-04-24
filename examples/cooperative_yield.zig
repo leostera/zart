@@ -58,5 +58,5 @@ pub fn main(_: std.process.Init) !void {
     } });
     try rt.run();
 
-    std.debug.print("sum 0..100000 = {d}\n", .{sum});
+    std.debug.print("sum 0..=100000 = {d}\n", .{sum});
 }
