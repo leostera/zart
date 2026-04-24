@@ -57,6 +57,27 @@ pub const Parker = struct {
     }
 };
 
+const TestBarrier = struct {
+    mutex: std.Io.Mutex = .init,
+    condition: std.Io.Condition = .init,
+    ready: bool = false,
+
+    fn signal(barrier: *TestBarrier, io: std.Io) void {
+        barrier.mutex.lockUncancelable(io);
+        defer barrier.mutex.unlock(io);
+
+        barrier.ready = true;
+        barrier.condition.signal(io);
+    }
+
+    fn wait(barrier: *TestBarrier, io: std.Io) void {
+        barrier.mutex.lockUncancelable(io);
+        defer barrier.mutex.unlock(io);
+
+        while (!barrier.ready) barrier.condition.waitUncancelable(io, &barrier.mutex);
+    }
+};
+
 test "parker consumes notification sent before wait" {
     const testing = std.testing;
 
@@ -72,17 +93,17 @@ test "parker wakes a waiting thread" {
     const Worker = struct {
         parker: *Parker,
         result: *Parker.WaitResult,
-        ready: *std.atomic.Value(bool),
+        ready: *TestBarrier,
 
         fn run(self: @This()) void {
-            self.ready.store(true, .release);
+            self.ready.signal(testing.io);
             self.result.* = self.parker.wait(testing.io);
         }
     };
 
     var parker: Parker = .{};
     var result: Parker.WaitResult = .closed;
-    var ready = std.atomic.Value(bool).init(false);
+    var ready: TestBarrier = .{};
 
     const thread = try std.Thread.spawn(.{}, Worker.run, .{Worker{
         .parker = &parker,
@@ -90,7 +111,7 @@ test "parker wakes a waiting thread" {
         .ready = &ready,
     }});
 
-    while (!ready.load(.acquire)) std.atomic.spinLoopHint();
+    ready.wait(testing.io);
     parker.notify(testing.io);
     thread.join();
 
@@ -103,17 +124,17 @@ test "parker close wakes a waiting thread" {
     const Worker = struct {
         parker: *Parker,
         result: *Parker.WaitResult,
-        ready: *std.atomic.Value(bool),
+        ready: *TestBarrier,
 
         fn run(self: @This()) void {
-            self.ready.store(true, .release);
+            self.ready.signal(testing.io);
             self.result.* = self.parker.wait(testing.io);
         }
     };
 
     var parker: Parker = .{};
     var result: Parker.WaitResult = .notified;
-    var ready = std.atomic.Value(bool).init(false);
+    var ready: TestBarrier = .{};
 
     const thread = try std.Thread.spawn(.{}, Worker.run, .{Worker{
         .parker = &parker,
@@ -121,7 +142,7 @@ test "parker close wakes a waiting thread" {
         .ready = &ready,
     }});
 
-    while (!ready.load(.acquire)) std.atomic.spinLoopHint();
+    ready.wait(testing.io);
     parker.close(testing.io);
     thread.join();
 
