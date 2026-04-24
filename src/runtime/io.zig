@@ -10,7 +10,7 @@ pub const RuntimeIo = struct {
     pub const Request = struct {
         next: ?*Request = null,
         actor: *anyopaque,
-        completed: bool = false,
+        completed: std.atomic.Value(bool) = .init(false),
         payload: Payload,
 
         const Payload = union(enum) {
@@ -105,6 +105,7 @@ pub const RuntimeIo = struct {
 
         if (shared.worker) |worker| worker.join();
 
+        discardCompletions(shared);
         std.debug.assert(shared.active_count == 0);
         allocator.destroy(shared);
         runtime_io.* = undefined;
@@ -128,7 +129,7 @@ pub const RuntimeIo = struct {
         std.debug.assert(!shared.stopping);
 
         request.next = null;
-        request.completed = false;
+        request.completed.store(false, .monotonic);
         if (shared.submissions_tail) |tail| {
             tail.next = request;
         } else {
@@ -189,7 +190,7 @@ pub const RuntimeIo = struct {
         shared.lock.lock();
         defer shared.lock.unlock();
 
-        request.completed = true;
+        request.completed.store(true, .release);
         request.next = null;
         if (shared.completions_tail) |tail| {
             tail.next = request;
@@ -204,6 +205,15 @@ pub const RuntimeIo = struct {
         defer shared.lock.unlock();
 
         return shared.stopping and shared.submissions_head == null;
+    }
+
+    fn discardCompletions(shared: *Shared) void {
+        while (shared.completions_head) |request| {
+            shared.completions_head = request.next;
+            request.next = null;
+            shared.active_count -= 1;
+        }
+        shared.completions_tail = null;
     }
 
     fn workerMain(shared: *Shared) void {
@@ -280,6 +290,15 @@ pub const ActorIoContext = struct {
 
     fn park(context: *ActorIoContext) void {
         context.park_fn(context.charge_runtime, context.charge_actor);
+    }
+
+    fn wait(context: *ActorIoContext, request: *RuntimeIo.Request) void {
+        context.runtime_io.submit(request);
+
+        // Always park once so the scheduler drains the completion before the
+        // actor can return and unwind this stack-backed request.
+        context.park();
+        while (!request.completed.load(.acquire)) context.park();
     }
 };
 
@@ -419,8 +438,7 @@ fn actorIoOperate(userdata: ?*anyopaque, operation: std.Io.Operation) std.Io.Can
     const context = actorIoContext(userdata);
     if (context.runtime_io.hasWorker()) {
         var request: RuntimeIo.Request = .initOperate(context.charge_actor, operation);
-        context.runtime_io.submit(&request);
-        while (!request.completed) context.park();
+        context.wait(&request);
         return request.payload.operate.result;
     }
 
@@ -458,8 +476,7 @@ fn actorIoSleep(userdata: ?*anyopaque, timeout: std.Io.Timeout) std.Io.Cancelabl
     const context = actorIoContext(userdata);
     if (context.runtime_io.hasWorker()) {
         var request: RuntimeIo.Request = .initSleep(context.charge_actor, timeout);
-        context.runtime_io.submit(&request);
-        while (!request.completed) context.park();
+        context.wait(&request);
         return request.payload.sleep.result;
     }
 

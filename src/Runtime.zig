@@ -105,8 +105,8 @@ pub const Runtime = struct {
 
     /// Destroys all live actors and runtime-owned internal storage.
     pub fn deinit(rt: *Runtime) void {
-        rt.actors.deinit(rt.internal_allocator, rt);
         rt.io.deinit(rt.internal_allocator);
+        rt.actors.deinit(rt.internal_allocator, rt);
         rt.* = undefined;
     }
 
