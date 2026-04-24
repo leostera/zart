@@ -11,6 +11,7 @@ pub const WorkerId = struct {
 
 pub fn Worker(comptime ActorHeader: type) type {
     return struct {
+        _: void align(std.atomic.cache_line) = {},
         id: WorkerId,
         scheduler_mutex: std.Io.Mutex = .init,
         scheduler: Scheduler = .{},
