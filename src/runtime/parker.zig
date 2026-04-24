@@ -8,7 +8,7 @@ const std = @import("std");
 pub const Parker = struct {
     mutex: std.Io.Mutex = .init,
     condition: std.Io.Condition = .init,
-    wakeups: usize = 0,
+    notified: bool = false,
     closed: bool = false,
 
     pub const WaitResult = enum {
@@ -20,7 +20,7 @@ pub const Parker = struct {
         parker.mutex.lockUncancelable(io);
         defer parker.mutex.unlock(io);
 
-        parker.wakeups += 1;
+        parker.notified = true;
         parker.condition.signal(io);
     }
 
@@ -28,7 +28,7 @@ pub const Parker = struct {
         parker.mutex.lockUncancelable(io);
         defer parker.mutex.unlock(io);
 
-        parker.wakeups += 1;
+        parker.notified = true;
         parker.condition.broadcast(io);
     }
 
@@ -44,12 +44,12 @@ pub const Parker = struct {
         parker.mutex.lockUncancelable(io);
         defer parker.mutex.unlock(io);
 
-        while (parker.wakeups == 0 and !parker.closed) {
+        while (!parker.notified and !parker.closed) {
             parker.condition.waitUncancelable(io, &parker.mutex);
         }
 
-        if (parker.wakeups != 0) {
-            parker.wakeups -= 1;
+        if (parker.notified) {
+            parker.notified = false;
             return .notified;
         }
 
