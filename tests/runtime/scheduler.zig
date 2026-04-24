@@ -296,3 +296,34 @@ test "actor self handle can enqueue messages to itself" {
 
     try testing.expectEqualSlices(u8, &.{ 0, 1, 2, 3, 4 }, observed[0..observed_len]);
 }
+
+test "runtime accepts configured worker count before SMP run mode" {
+    const testing = std.testing;
+
+    const StopMsg = union(enum) {
+        stop,
+    };
+
+    const Stopper = struct {
+        pub const Msg = StopMsg;
+
+        stopped: *bool,
+
+        pub fn run(self: *@This(), ctx: *Ctx(Msg)) !void {
+            switch (try ctx.recv()) {
+                .stop => self.stopped.* = true,
+            }
+        }
+    };
+
+    var rt = try Runtime.init(testing.allocator, .{ .worker_count = 4 });
+    defer rt.deinit();
+
+    var stopped = false;
+    const stopper = try rt.spawn(Stopper{ .stopped = &stopped });
+
+    try stopper.send(.stop);
+    try rt.run();
+
+    try testing.expect(stopped);
+}

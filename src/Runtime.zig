@@ -46,6 +46,7 @@ const WaitReason = union(enum) {
 const ActorHeader = struct {
     runtime: *Runtime,
     id: ActorId,
+    owner_worker: usize,
     msg_type: usize,
     state: std.atomic.Value(ActorState),
     wait_reason: WaitReason,
@@ -92,6 +93,8 @@ pub const Runtime = struct {
         execution_budget: usize = 64,
         /// Number of completed I/O boundaries an actor may pass per scheduler turn.
         io_budget: usize = 64,
+        /// Number of scheduler workers. Only worker 0 is executed until SMP run mode lands.
+        worker_count: usize = 1,
         /// Allocator used for actor cells, fiber stacks, registry slots, and inbox nodes.
         internal_allocator: ?Allocator = null,
         /// Optional runtime event sink. `null` avoids constructing trace events.
@@ -106,7 +109,7 @@ pub const Runtime = struct {
     io: RuntimeIo,
     stacks: StackPool,
     actors: Registry,
-    worker: Worker,
+    workers: []Worker,
 
     /// Creates a runtime. `allocator` is exposed to actors through `ctx.allocator()`.
     pub fn init(allocator: Allocator, options: Options) RuntimeIo.InitError!Runtime {
@@ -118,6 +121,13 @@ pub const Runtime = struct {
         errdefer stacks.deinit();
         if (options.preallocate_stack_slab) try stacks.preallocateSlab();
 
+        const worker_count = @max(options.worker_count, 1);
+        const workers = try internal_allocator.alloc(Worker, worker_count);
+        errdefer internal_allocator.free(workers);
+        for (workers, 0..) |*worker_slot, index| {
+            worker_slot.* = .init(.{ .index = index });
+        }
+
         return .{
             .allocator = allocator,
             .internal_allocator = internal_allocator,
@@ -125,7 +135,7 @@ pub const Runtime = struct {
             .io = runtime_io,
             .stacks = stacks,
             .actors = .{},
-            .worker = .init(.{ .index = 0 }),
+            .workers = workers,
         };
     }
 
@@ -134,6 +144,7 @@ pub const Runtime = struct {
         rt.actors.deinit(rt.internal_allocator, rt);
         rt.stacks.deinit();
         rt.io.deinit(rt.internal_allocator);
+        rt.internal_allocator.free(rt.workers);
         rt.* = undefined;
     }
 
@@ -182,12 +193,13 @@ pub const Runtime = struct {
             ready.budget_remaining = rt.executionBudget();
             ready.io_budget_remaining = rt.ioBudget();
             rt.traceActorResumed(ready.id);
-            rt.worker.setCurrent(ready);
+            const current_worker = rt.primaryWorker();
+            current_worker.setCurrent(ready);
             const status = ready.fiber.run() catch |err| {
-                rt.worker.setCurrent(null);
+                current_worker.setCurrent(null);
                 return err;
             };
-            rt.worker.setCurrent(null);
+            current_worker.setCurrent(null);
             switch (status) {
                 .created => unreachable,
                 .running => unreachable,
@@ -239,7 +251,7 @@ pub const Runtime = struct {
         const actor_id = try rt.actors.reserve(rt.internal_allocator);
         errdefer rt.actors.cancelReserve(actor_id);
 
-        cell.* = Cell.init(rt, actor_id, stack, actor_value);
+        cell.* = Cell.init(rt, actor_id, rt.spawnOwnerWorker(), stack, actor_value);
         cell.header.fiber = try Fiber.init(stack, Cell.fiberEntry, cell);
         errdefer cell.header.fiber.deinit();
 
@@ -260,6 +272,18 @@ pub const Runtime = struct {
         rt.stacks.deinit();
         rt.stacks = .init(rt.internal_allocator, rt.options.stack_size, rt.options.stack_slab_size);
         if (rt.options.preallocate_stack_slab) try rt.stacks.preallocateSlab();
+    }
+
+    fn primaryWorker(rt: *Runtime) *Worker {
+        return &rt.workers[0];
+    }
+
+    fn ownerWorker(rt: *Runtime, target: *const ActorHeader) *Worker {
+        return &rt.workers[target.owner_worker];
+    }
+
+    fn spawnOwnerWorker(rt: *Runtime) usize {
+        return if (rt.primaryWorker().currentActor()) |current| current.owner_worker else 0;
     }
 
     fn resolve(rt: *Runtime, comptime Msg: type, actor_id: ActorId) !*ActorHeader {
@@ -290,11 +314,11 @@ pub const Runtime = struct {
     }
 
     fn enqueue(rt: *Runtime, target: *ActorHeader) void {
-        rt.worker.enqueue(target);
+        rt.ownerWorker(target).enqueue(target);
     }
 
     fn dequeue(rt: *Runtime) ?*ActorHeader {
-        return rt.worker.dequeue();
+        return rt.primaryWorker().dequeue();
     }
 
     fn destroyActor(rt: *Runtime, target: *ActorHeader) void {
@@ -384,7 +408,7 @@ pub const Runtime = struct {
         if (rt.options.tracer) |tracer| {
             tracer.record(.{
                 .message_sent = .{
-                    .from = if (rt.worker.currentActor()) |current| current.id else null,
+                    .from = if (rt.primaryWorker().currentActor()) |current| current.id else null,
                     .to = to,
                 },
             });
@@ -496,11 +520,12 @@ fn FunctionActorCell(comptime Msg: type, comptime entry: anytype) type {
 
         const Self = @This();
 
-        fn init(rt: *Runtime, actor_id: ActorId, stack: []align(Fiber.stack_alignment) u8, _: void) Self {
+        fn init(rt: *Runtime, actor_id: ActorId, owner_worker: usize, stack: []align(Fiber.stack_alignment) u8, _: void) Self {
             return .{
                 .header = .{
                     .runtime = rt,
                     .id = actor_id,
+                    .owner_worker = owner_worker,
                     .msg_type = typeId(Msg),
                     .state = .init(.runnable),
                     .wait_reason = .none,
@@ -556,11 +581,12 @@ fn StructActorCell(comptime Msg: type, comptime ActorType: type) type {
 
         const Self = @This();
 
-        fn init(rt: *Runtime, actor_id: ActorId, stack: []align(Fiber.stack_alignment) u8, instance: ActorType) Self {
+        fn init(rt: *Runtime, actor_id: ActorId, owner_worker: usize, stack: []align(Fiber.stack_alignment) u8, instance: ActorType) Self {
             return .{
                 .header = .{
                     .runtime = rt,
                     .id = actor_id,
+                    .owner_worker = owner_worker,
                     .msg_type = typeId(Msg),
                     .state = .init(.runnable),
                     .wait_reason = .none,
