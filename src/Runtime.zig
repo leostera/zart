@@ -32,9 +32,11 @@ const ActorHeader = struct {
 pub const Runtime = struct {
     pub const Options = struct {
         stack_size: usize = 64 * 1024,
+        internal_allocator: ?Allocator = null,
     };
 
     allocator: Allocator,
+    internal_allocator: Allocator,
     options: Options,
     actors: std.ArrayList(?*ActorHeader),
     run_head: ?*ActorHeader,
@@ -44,6 +46,7 @@ pub const Runtime = struct {
     pub fn init(allocator: Allocator, options: Options) Runtime {
         return .{
             .allocator = allocator,
+            .internal_allocator = options.internal_allocator orelse std.heap.smp_allocator,
             .options = options,
             .actors = .empty,
             .run_head = null,
@@ -56,7 +59,7 @@ pub const Runtime = struct {
         for (rt.actors.items) |maybe_actor| {
             if (maybe_actor) |actor| actor.destroy_fn(rt, actor);
         }
-        rt.actors.deinit(rt.allocator);
+        rt.actors.deinit(rt.internal_allocator);
         rt.* = undefined;
     }
 
@@ -119,15 +122,15 @@ pub const Runtime = struct {
     }
 
     fn spawnCell(rt: *Runtime, comptime Msg: type, comptime Cell: type, actor_value: anytype) !Mailbox(Msg) {
-        const cell = try rt.allocator.create(Cell);
-        errdefer rt.allocator.destroy(cell);
+        const cell = try rt.internal_allocator.create(Cell);
+        errdefer rt.internal_allocator.destroy(cell);
 
-        const stack = try rt.allocator.alignedAlloc(
+        const stack = try rt.internal_allocator.alignedAlloc(
             u8,
             std.mem.Alignment.fromByteUnits(Fiber.stack_alignment),
             rt.options.stack_size,
         );
-        errdefer rt.allocator.free(stack);
+        errdefer rt.internal_allocator.free(stack);
 
         const actor_id: ActorId = .{
             .index = rt.actors.items.len,
@@ -138,7 +141,7 @@ pub const Runtime = struct {
         cell.header.fiber = try Fiber.init(stack, Cell.fiberEntry, cell);
         errdefer cell.header.fiber.deinit();
 
-        try rt.actors.append(rt.allocator, &cell.header);
+        try rt.actors.append(rt.internal_allocator, &cell.header);
         rt.enqueue(&cell.header);
 
         return .{
@@ -304,7 +307,7 @@ fn FunctionActorCell(comptime Msg: type, comptime entry: anytype) type {
                     .send_fn = send,
                     .destroy_fn = destroy,
                 },
-                .inbox = .init(rt.allocator),
+                .inbox = .init(rt.internal_allocator),
             };
         }
 
@@ -332,8 +335,8 @@ fn FunctionActorCell(comptime Msg: type, comptime entry: anytype) type {
             const cell: *Self = @ptrCast(@alignCast(header));
             cell.inbox.deinit();
             cell.header.fiber.deinit();
-            rt.allocator.free(cell.header.stack);
-            rt.allocator.destroy(cell);
+            rt.internal_allocator.free(cell.header.stack);
+            rt.internal_allocator.destroy(cell);
         }
     };
 }
@@ -360,7 +363,7 @@ fn StructActorCell(comptime Msg: type, comptime Actor: type) type {
                     .send_fn = send,
                     .destroy_fn = destroy,
                 },
-                .inbox = .init(rt.allocator),
+                .inbox = .init(rt.internal_allocator),
                 .actor = actor,
             };
         }
@@ -389,8 +392,8 @@ fn StructActorCell(comptime Msg: type, comptime Actor: type) type {
             const cell: *Self = @ptrCast(@alignCast(header));
             cell.inbox.deinit();
             cell.header.fiber.deinit();
-            rt.allocator.free(cell.header.stack);
-            rt.allocator.destroy(cell);
+            rt.internal_allocator.free(cell.header.stack);
+            rt.internal_allocator.destroy(cell);
         }
     };
 }
@@ -497,7 +500,7 @@ test "function actor counter" {
         };
     };
 
-    var rt = Runtime.init(std.heap.page_allocator, .{});
+    var rt = Runtime.init(testing.allocator, .{});
     defer rt.deinit();
 
     var observed: u64 = 0;
@@ -559,7 +562,7 @@ test "struct actor counter" {
         };
     };
 
-    var rt = Runtime.init(std.heap.page_allocator, .{});
+    var rt = Runtime.init(testing.allocator, .{});
     defer rt.deinit();
 
     var observed: u64 = 0;
