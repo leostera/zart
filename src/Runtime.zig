@@ -8,6 +8,38 @@ pub const ActorId = struct {
     generation: u32,
 };
 
+pub const MessageTrace = struct {
+    from: ?ActorId,
+    to: ActorId,
+};
+
+pub const FailureTrace = struct {
+    actor: ActorId,
+    err: anyerror,
+};
+
+pub const TraceEvent = union(enum) {
+    actor_spawned: ActorId,
+    actor_resumed: ActorId,
+    actor_waiting: ActorId,
+    actor_yielded: ActorId,
+    actor_completed: ActorId,
+    actor_failed: FailureTrace,
+    message_sent: MessageTrace,
+    message_received: ActorId,
+};
+
+pub const Tracer = struct {
+    context: ?*anyopaque = null,
+    event_fn: *const fn (?*anyopaque, TraceEvent) void = noop,
+
+    pub fn record(tracer: Tracer, event: TraceEvent) void {
+        tracer.event_fn(tracer.context, event);
+    }
+
+    fn noop(_: ?*anyopaque, _: TraceEvent) void {}
+};
+
 const ActorState = enum {
     runnable,
     running,
@@ -36,6 +68,7 @@ pub const Runtime = struct {
         /// Number of explicit yield checkpoints an actor may pass per scheduler turn.
         execution_budget: usize = 64,
         internal_allocator: ?Allocator = null,
+        tracer: Tracer = .{},
     };
 
     allocator: Allocator,
@@ -79,6 +112,12 @@ pub const Runtime = struct {
 
     pub fn send(rt: *Runtime, comptime Msg: type, actor_id: ActorId, msg: Msg) !void {
         const actor = try rt.resolve(Msg, actor_id);
+        rt.trace(.{
+            .message_sent = .{
+                .from = if (rt.current_actor) |current| current.id else null,
+                .to = actor.id,
+            },
+        });
         try actor.send_fn(actor, &msg);
         rt.wake(actor);
     }
@@ -89,6 +128,7 @@ pub const Runtime = struct {
 
             actor.state = .running;
             actor.budget_remaining = rt.executionBudget();
+            rt.trace(.{ .actor_resumed = actor.id });
             rt.current_actor = actor;
             const status = actor.fiber.run() catch |err| {
                 rt.current_actor = null;
@@ -106,10 +146,16 @@ pub const Runtime = struct {
                     .runnable, .waiting => {},
                     .completed, .failed => unreachable,
                 },
-                .completed => actor.state = .completed,
+                .completed => {
+                    actor.state = .completed;
+                    rt.trace(.{ .actor_completed = actor.id });
+                },
                 .failed => {
                     actor.state = .failed;
-                    if (actor.fiber.failure()) |err| return err;
+                    if (actor.fiber.failure()) |err| {
+                        rt.trace(.{ .actor_failed = .{ .actor = actor.id, .err = err } });
+                        return err;
+                    }
                 },
             }
         }
@@ -146,6 +192,7 @@ pub const Runtime = struct {
         errdefer cell.header.fiber.deinit();
 
         try rt.actors.append(rt.internal_allocator, &cell.header);
+        rt.trace(.{ .actor_spawned = actor_id });
         rt.enqueue(&cell.header);
 
         return .{
@@ -204,6 +251,10 @@ pub const Runtime = struct {
     fn executionBudget(rt: *const Runtime) usize {
         return @max(rt.options.execution_budget, 1);
     }
+
+    fn trace(rt: *Runtime, event: TraceEvent) void {
+        rt.options.tracer.record(event);
+    }
 };
 
 pub fn Mailbox(comptime Msg: type) type {
@@ -230,8 +281,12 @@ pub fn Ctx(comptime Msg: type) type {
 
         pub fn recv(ctx: *@This()) !Msg {
             while (true) {
-                if (ctx.inbox.pop()) |msg| return msg;
+                if (ctx.inbox.pop()) |msg| {
+                    ctx.runtime.trace(.{ .message_received = ctx.actor.id });
+                    return msg;
+                }
 
+                ctx.runtime.trace(.{ .actor_waiting = ctx.actor.id });
                 ctx.actor.state = .waiting;
                 Fiber.yield();
             }
@@ -244,6 +299,7 @@ pub fn Ctx(comptime Msg: type) type {
             }
 
             ctx.actor.budget_remaining = 0;
+            ctx.runtime.trace(.{ .actor_yielded = ctx.actor.id });
             ctx.actor.state = .runnable;
             ctx.runtime.enqueue(ctx.actor);
             Fiber.yield();
@@ -799,4 +855,78 @@ test "actor can spawn child actor" {
     try rt.run();
 
     try testing.expectEqual(@as(u64, 42), observed);
+}
+
+test "tracer records runtime events" {
+    const testing = std.testing;
+
+    const StopMsg = union(enum) {
+        stop,
+    };
+
+    const Recorder = struct {
+        events: [16]TraceEvent = undefined,
+        len: usize = 0,
+
+        fn tracer(recorder: *@This()) Tracer {
+            return .{
+                .context = recorder,
+                .event_fn = record,
+            };
+        }
+
+        fn record(context: ?*anyopaque, event: TraceEvent) void {
+            const recorder: *@This() = @ptrCast(@alignCast(context.?));
+            recorder.events[recorder.len] = event;
+            recorder.len += 1;
+        }
+    };
+
+    const Actor = struct {
+        pub const Msg = StopMsg;
+
+        pub fn run(_: *@This(), ctx: *Ctx(StopMsg)) !void {
+            switch (try ctx.recv()) {
+                .stop => return,
+            }
+        }
+    };
+
+    var recorder: Recorder = .{};
+    var rt = Runtime.init(testing.allocator, .{ .tracer = recorder.tracer() });
+    defer rt.deinit();
+
+    const mailbox = try rt.spawn(Actor{});
+    try mailbox.send(.stop);
+    try rt.run();
+
+    try testing.expectEqual(@as(usize, 5), recorder.len);
+
+    switch (recorder.events[0]) {
+        .actor_spawned => |actor_id| try testing.expectEqual(mailbox.actor_id, actor_id),
+        else => return error.UnexpectedTraceEvent,
+    }
+
+    switch (recorder.events[1]) {
+        .message_sent => |message| {
+            try testing.expectEqual(@as(?ActorId, null), message.from);
+            try testing.expectEqual(mailbox.actor_id, message.to);
+        },
+        else => return error.UnexpectedTraceEvent,
+    }
+
+    switch (recorder.events[2]) {
+        .actor_resumed => |actor_id| try testing.expectEqual(mailbox.actor_id, actor_id),
+        else => return error.UnexpectedTraceEvent,
+    }
+
+    switch (recorder.events[3]) {
+        .message_received => |actor_id| try testing.expectEqual(mailbox.actor_id, actor_id),
+        else => return error.UnexpectedTraceEvent,
+    }
+
+    switch (recorder.events[4]) {
+        .actor_completed => |actor_id| try testing.expectEqual(mailbox.actor_id, actor_id),
+        else => return error.UnexpectedTraceEvent,
+    }
 }
