@@ -133,7 +133,7 @@ pub const Runtime = struct {
     io: RuntimeIo,
     stacks: []StackPool,
     actors: Registry,
-    retired_mutex: std.Io.Mutex,
+    lifetime_mutex: std.Io.Mutex,
     retired: RetiredActors,
     workers: []Worker,
     next_external_spawn_worker: std.atomic.Value(usize),
@@ -174,7 +174,7 @@ pub const Runtime = struct {
             .io = runtime_io,
             .stacks = stacks,
             .actors = .{},
-            .retired_mutex = .init,
+            .lifetime_mutex = .init,
             .retired = .{},
             .workers = workers,
             .next_external_spawn_worker = .init(0),
@@ -214,6 +214,9 @@ pub const Runtime = struct {
     /// Sends a message to a raw actor id. Prefer `Actor(Msg).send` in user code.
     pub fn send(rt: *Runtime, comptime Msg: type, actor_id: ActorId, msg: Msg) !void {
         if (rt.state() == .stopped) return error.RuntimeStopped;
+
+        rt.lifetime_mutex.lockUncancelable(rt.options.scheduler_io);
+        defer rt.lifetime_mutex.unlock(rt.options.scheduler_io);
 
         const target = try rt.resolve(Msg, actor_id);
         rt.traceMessageSent(target.id);
@@ -625,15 +628,17 @@ pub const Runtime = struct {
     }
 
     fn destroyActor(rt: *Runtime, target: *ActorHeader) void {
+        rt.lifetime_mutex.lockUncancelable(rt.options.scheduler_io);
+        defer rt.lifetime_mutex.unlock(rt.options.scheduler_io);
+
         rt.actors.remove(rt.options.scheduler_io, target);
-        rt.retired_mutex.lockUncancelable(rt.options.scheduler_io);
-        defer rt.retired_mutex.unlock(rt.options.scheduler_io);
         rt.retired.retire(target);
     }
 
     fn reclaimRetiredActors(rt: *Runtime) void {
-        rt.retired_mutex.lockUncancelable(rt.options.scheduler_io);
-        defer rt.retired_mutex.unlock(rt.options.scheduler_io);
+        rt.lifetime_mutex.lockUncancelable(rt.options.scheduler_io);
+        defer rt.lifetime_mutex.unlock(rt.options.scheduler_io);
+
         rt.retired.drain(rt);
     }
 
