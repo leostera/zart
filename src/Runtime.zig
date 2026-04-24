@@ -398,7 +398,7 @@ pub const Runtime = struct {
             if (worker_index == 0) {
                 try rt.pollIo(.nonblocking);
                 rt.drainIoCompletions();
-                if (rt.io.hasPoller() and rt.io.hasPending() and rt.runnable_count.load(.acquire) == 0) {
+                if (rt.io.hasPoller() and rt.io.hasPending() and !rt.hasRunnableActors() and !rt.hasActiveActors()) {
                     try rt.pollIo(.wait);
                     rt.drainIoCompletions();
                     continue;
@@ -429,9 +429,9 @@ pub const Runtime = struct {
             return true;
         }
 
-        _ = rt.active_worker_count.fetchAdd(1, .acq_rel);
+        rt.beginActorTurn();
         rt.turn_mutex.unlock(rt.options.scheduler_io);
-        defer _ = rt.active_worker_count.fetchSub(1, .acq_rel);
+        defer rt.endActorTurn();
 
         ready.storeWaitReason(.none);
         ready.budget_remaining = rt.executionBudget();
@@ -653,7 +653,7 @@ pub const Runtime = struct {
 
     fn dequeue(rt: *Runtime, target_worker: *Worker) ?*ActorHeader {
         const target = target_worker.dequeue(rt.options.scheduler_io) orelse rt.steal(target_worker) orelse return null;
-        _ = rt.runnable_count.fetchSub(1, .acq_rel);
+        rt.noteRunnableDequeued();
         return target;
     }
 
@@ -669,16 +669,39 @@ pub const Runtime = struct {
         _ = rt.runnable_count.fetchAdd(1, .acq_rel);
     }
 
+    fn noteRunnableDequeued(rt: *Runtime) void {
+        const previous = rt.runnable_count.fetchSub(1, .acq_rel);
+        if (previous == 0) @panic("runnable actor count underflow");
+    }
+
+    fn beginActorTurn(rt: *Runtime) void {
+        const previous = rt.active_worker_count.fetchAdd(1, .acq_rel);
+        if (previous >= rt.workers.len) @panic("active actor count exceeds worker count");
+    }
+
+    fn endActorTurn(rt: *Runtime) void {
+        const previous = rt.active_worker_count.fetchSub(1, .acq_rel);
+        if (previous == 0) @panic("active actor count underflow");
+    }
+
+    fn hasRunnableActors(rt: *Runtime) bool {
+        return rt.runnable_count.load(.acquire) != 0;
+    }
+
+    fn hasActiveActors(rt: *Runtime) bool {
+        return rt.active_worker_count.load(.acquire) != 0;
+    }
+
     fn tryQuiesceSmp(rt: *Runtime) bool {
         rt.turn_mutex.lockUncancelable(rt.options.scheduler_io);
         defer rt.turn_mutex.unlock(rt.options.scheduler_io);
 
-        if (rt.runnable_count.load(.acquire) != 0) return false;
-        if (rt.active_worker_count.load(.acquire) != 0) return false;
+        if (rt.hasRunnableActors()) return false;
+        if (rt.hasActiveActors()) return false;
         if (rt.io.hasCompletions(rt.options.scheduler_io)) return false;
         if (rt.io.hasPoller() and rt.io.hasPending()) return false;
-        if (rt.runnable_count.load(.acquire) != 0) return false;
-        if (rt.active_worker_count.load(.acquire) != 0) return false;
+        if (rt.hasRunnableActors()) return false;
+        if (rt.hasActiveActors()) return false;
 
         if (rt.smp_quiescing.cmpxchgStrong(false, true, .acq_rel, .acquire) == null) {
             for (rt.workers) |*target_worker| target_worker.notify(rt.options.scheduler_io);
@@ -705,7 +728,7 @@ pub const Runtime = struct {
         rt.turn_mutex.lockUncancelable(rt.options.scheduler_io);
         defer rt.turn_mutex.unlock(rt.options.scheduler_io);
 
-        if (rt.active_worker_count.load(.acquire) != 0) return;
+        if (rt.hasActiveActors()) return;
 
         while (rt.io.popCompletion(rt.options.scheduler_io)) |request| {
             const target: *ActorHeader = @ptrCast(@alignCast(request.actor));
@@ -794,7 +817,7 @@ pub const Runtime = struct {
     fn validateRestInvariants(rt: *Runtime) InvariantError!void {
         if (!rt.options.validate_invariants) return;
 
-        if (rt.active_worker_count.load(.acquire) != 0) return error.ActiveActorsAtRest;
+        if (rt.hasActiveActors()) return error.ActiveActorsAtRest;
         for (rt.workers) |*runtime_worker| {
             if (runtime_worker.currentActor() != null) return error.WorkerHasCurrentActorAtRest;
         }
