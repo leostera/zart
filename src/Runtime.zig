@@ -5,9 +5,9 @@ const inbox = @import("runtime/inbox.zig");
 const concrete_io = @import("io.zig");
 const io = @import("runtime/io.zig");
 const registry = @import("runtime/registry.zig");
-const scheduler = @import("runtime/scheduler.zig");
 const stack_pool = @import("runtime/stack_pool.zig");
 const trace = @import("runtime/trace.zig");
+const worker = @import("runtime/worker.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -26,8 +26,8 @@ pub const PosixIo = concrete_io.Posix;
 const ActorIoContext = io.ActorIoContext;
 const RuntimeIo = io.RuntimeIo;
 const Registry = registry.Registry(ActorHeader);
-const Scheduler = scheduler.Scheduler(ActorHeader);
 const StackPool = stack_pool.StackPool;
+const Worker = worker.Worker(ActorHeader);
 
 const ActorState = enum(u8) {
     runnable,
@@ -106,7 +106,7 @@ pub const Runtime = struct {
     io: RuntimeIo,
     stacks: StackPool,
     actors: Registry,
-    scheduler: Scheduler,
+    worker: Worker,
 
     /// Creates a runtime. `allocator` is exposed to actors through `ctx.allocator()`.
     pub fn init(allocator: Allocator, options: Options) RuntimeIo.InitError!Runtime {
@@ -125,7 +125,7 @@ pub const Runtime = struct {
             .io = runtime_io,
             .stacks = stacks,
             .actors = .{},
-            .scheduler = .{},
+            .worker = .init(.{ .index = 0 }),
         };
     }
 
@@ -182,12 +182,12 @@ pub const Runtime = struct {
             ready.budget_remaining = rt.executionBudget();
             ready.io_budget_remaining = rt.ioBudget();
             rt.traceActorResumed(ready.id);
-            rt.scheduler.setCurrent(ready);
+            rt.worker.setCurrent(ready);
             const status = ready.fiber.run() catch |err| {
-                rt.scheduler.setCurrent(null);
+                rt.worker.setCurrent(null);
                 return err;
             };
-            rt.scheduler.setCurrent(null);
+            rt.worker.setCurrent(null);
             switch (status) {
                 .created => unreachable,
                 .running => unreachable,
@@ -290,11 +290,11 @@ pub const Runtime = struct {
     }
 
     fn enqueue(rt: *Runtime, target: *ActorHeader) void {
-        rt.scheduler.enqueue(target);
+        rt.worker.enqueue(target);
     }
 
     fn dequeue(rt: *Runtime) ?*ActorHeader {
-        return rt.scheduler.dequeue();
+        return rt.worker.dequeue();
     }
 
     fn destroyActor(rt: *Runtime, target: *ActorHeader) void {
@@ -384,7 +384,7 @@ pub const Runtime = struct {
         if (rt.options.tracer) |tracer| {
             tracer.record(.{
                 .message_sent = .{
-                    .from = if (rt.scheduler.current_actor) |current| current.id else null,
+                    .from = if (rt.worker.currentActor()) |current| current.id else null,
                     .to = to,
                 },
             });

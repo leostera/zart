@@ -27,4 +27,5 @@ test {
     _ = testing;
     _ = @import("runtime/parker.zig");
     _ = @import("runtime/scheduler.zig");
+    _ = @import("runtime/worker.zig");
 }
