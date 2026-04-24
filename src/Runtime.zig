@@ -283,7 +283,7 @@ pub const Runtime = struct {
             fn run(context: *@This()) void {
                 context.runtime.runSmpWorker(context.worker_index) catch |err| {
                     context.err = err;
-                    context.runtime.stop();
+                    context.runtime.requestSmpQuiesce();
                 };
             }
         };
@@ -302,9 +302,12 @@ pub const Runtime = struct {
         }
 
         var spawned: usize = 0;
+        var threads_joined = false;
         errdefer {
-            rt.stop();
-            for (threads[0..spawned]) |thread| thread.join();
+            if (!threads_joined) {
+                rt.stop();
+                for (threads[0..spawned]) |thread| thread.join();
+            }
         }
         for (threads, contexts) |*thread, *context| {
             thread.* = try std.Thread.spawn(.{}, ThreadContext.run, .{context});
@@ -313,12 +316,12 @@ pub const Runtime = struct {
 
         var main_err: ?anyerror = null;
         rt.runSmpWorker(0) catch |err| {
-            rt.stop();
+            rt.requestSmpQuiesce();
             main_err = err;
         };
 
         for (threads) |thread| thread.join();
-        spawned = 0;
+        threads_joined = true;
 
         if (main_err) |err| return err;
         for (contexts) |context| {
@@ -364,6 +367,11 @@ pub const Runtime = struct {
 
     fn closeWorkers(rt: *Runtime) void {
         for (rt.workers) |*target_worker| target_worker.close(rt.options.scheduler_io);
+    }
+
+    fn requestSmpQuiesce(rt: *Runtime) void {
+        rt.smp_quiescing.store(true, .release);
+        for (rt.workers) |*target_worker| target_worker.notify(rt.options.scheduler_io);
     }
 
     fn resolvedWorkerCount(configured: usize) usize {

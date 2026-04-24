@@ -61,6 +61,59 @@ test "actor failure destroys actor and invalidates handle" {
     try testing.expectError(error.InvalidActor, failing.send(.go));
 }
 
+test "actor failure returns from current run without stopping runtime" {
+    const testing = std.testing;
+
+    const FailingMsg = union(enum) {
+        go,
+    };
+
+    const SurvivorMsg = union(enum) {
+        ping,
+    };
+
+    const FailingActor = struct {
+        pub const Msg = FailingMsg;
+
+        pub fn run(_: *@This(), ctx: *Ctx(Msg)) !void {
+            _ = try ctx.recv();
+            return error.Boom;
+        }
+    };
+
+    const Survivor = struct {
+        pub const Msg = SurvivorMsg;
+
+        observed: *bool,
+
+        pub fn run(self: *@This(), ctx: *Ctx(Msg)) !void {
+            _ = try ctx.recv();
+            self.observed.* = true;
+        }
+    };
+
+    var rt = try Runtime.init(testing.allocator, .{
+        .worker_count = 2,
+        .execution_budget = 1,
+        .preallocate_stack_slab = false,
+    });
+    defer rt.deinit();
+
+    var observed = false;
+    const failing = try rt.spawn(FailingActor{});
+    const survivor = try rt.spawn(Survivor{ .observed = &observed });
+
+    try failing.send(.go);
+    try testing.expectError(error.Boom, rt.run());
+    try testing.expectEqual(Runtime.State.idle, rt.state());
+    try testing.expectError(error.InvalidActor, failing.send(.go));
+
+    try survivor.send(.ping);
+    try rt.run();
+
+    try testing.expect(observed);
+}
+
 test "completed actors release their registry slot" {
     const testing = std.testing;
 

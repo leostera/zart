@@ -111,6 +111,8 @@ If an actor returns an error from its body:
 - The actor is removed from the registry.
 - The actor is retired for later destruction.
 - `Runtime.run()` returns that error.
+- The runtime returns to `idle`; unrelated live actors may continue on a later
+  `run()`.
 - Sends through existing handles fail with `error.InvalidActor` or
   `error.ActorDead`, depending on whether the registry slot has already been
   removed.
