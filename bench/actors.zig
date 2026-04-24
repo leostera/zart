@@ -2,6 +2,8 @@ const builtin = @import("builtin");
 const std = @import("std");
 const zart = @import("zart");
 
+const posix = std.posix;
+
 const KiB = 1024;
 const MiB = 1024 * KiB;
 const GiB = 1024 * MiB;
@@ -993,6 +995,30 @@ fn benchSocketThroughput(reporter: Reporter, options: Options) !void {
         );
         defer std.heap.page_allocator.free(raw_name);
         try runMeasuredThroughput(reporter, options, raw_name, case.total_bytes, case, measureRawStdIoSocketThroughput);
+
+        const raw_posix_name = try std.fmt.allocPrint(
+            std.heap.page_allocator,
+            "raw posix read/write socket total={d} chunk={d}",
+            .{ case.total_bytes, case.chunk_size },
+        );
+        defer std.heap.page_allocator.free(raw_posix_name);
+        try runMeasuredThroughput(reporter, options, raw_posix_name, case.total_bytes, case, measureRawPosixSocketThroughput);
+
+        const raw_vectored_name = try std.fmt.allocPrint(
+            std.heap.page_allocator,
+            "raw posix readv/sendmsg socket total={d} chunk={d}",
+            .{ case.total_bytes, case.chunk_size },
+        );
+        defer std.heap.page_allocator.free(raw_vectored_name);
+        try runMeasuredThroughput(reporter, options, raw_vectored_name, case.total_bytes, case, measureRawPosixVectoredSocketThroughput);
+
+        const raw_pump_name = try std.fmt.allocPrint(
+            std.heap.page_allocator,
+            "raw posix nonblocking pump socket total={d} chunk={d}",
+            .{ case.total_bytes, case.chunk_size },
+        );
+        defer std.heap.page_allocator.free(raw_pump_name);
+        try runMeasuredThroughput(reporter, options, raw_pump_name, case.total_bytes, case, measureRawPosixNonblockingPumpSocketThroughput);
     }
 }
 
@@ -1146,6 +1172,353 @@ fn measureRawStdIoSocketThroughput(reporter: Reporter, _: Options, case: SocketT
     if (writer_args.bytes_written != case.total_bytes) return error.UnexpectedNetworkWrite;
 
     return end - start;
+}
+
+const RawPosixSocketWriterArgs = struct {
+    fd: posix.fd_t,
+    total_bytes: usize,
+    chunk: []const u8,
+    start: *std.atomic.Value(bool),
+    bytes_written: usize = 0,
+    err: ?anyerror = null,
+};
+
+fn rawPosixSocketWriter(args: *RawPosixSocketWriterArgs) void {
+    rawPosixSocketWriterRun(args) catch |err| {
+        args.err = err;
+    };
+}
+
+fn rawPosixSocketWriterRun(args: *RawPosixSocketWriterArgs) !void {
+    while (!args.start.load(.acquire)) std.atomic.spinLoopHint();
+
+    var total: usize = 0;
+    while (total < args.total_bytes) {
+        const remaining = args.total_bytes - total;
+        const len = @min(args.chunk.len, remaining);
+        try rawWriteAll(args.fd, args.chunk[0..len]);
+        total += len;
+    }
+    args.bytes_written = total;
+}
+
+fn measureRawPosixSocketThroughput(reporter: Reporter, _: Options, case: SocketThroughputCase) !i96 {
+    if (!@hasDecl(posix.system, "socketpair")) return error.UnsupportedBenchmark;
+
+    var sockets: [2]posix.fd_t = undefined;
+    switch (posix.errno(posix.system.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sockets))) {
+        .SUCCESS => {},
+        else => return error.UnsupportedBenchmark,
+    }
+    defer closeFd(sockets[0]);
+    defer closeFd(sockets[1]);
+
+    const write_chunk = try std.heap.page_allocator.alloc(u8, case.chunk_size);
+    defer std.heap.page_allocator.free(write_chunk);
+    const read_buffer = try std.heap.page_allocator.alloc(u8, case.chunk_size);
+    defer std.heap.page_allocator.free(read_buffer);
+    @memset(write_chunk, 't');
+
+    var start_gate = std.atomic.Value(bool).init(false);
+    var writer_args: RawPosixSocketWriterArgs = .{
+        .fd = sockets[1],
+        .total_bytes = case.total_bytes,
+        .chunk = write_chunk,
+        .start = &start_gate,
+    };
+
+    const thread = try std.Thread.spawn(.{}, rawPosixSocketWriter, .{&writer_args});
+    var joined = false;
+    defer if (!joined) thread.join();
+
+    var bytes_read: usize = 0;
+    const start = nowNs(reporter.io);
+    start_gate.store(true, .release);
+    while (bytes_read < case.total_bytes) {
+        const remaining = case.total_bytes - bytes_read;
+        const len = @min(read_buffer.len, remaining);
+        try rawReadAll(sockets[0], read_buffer[0..len]);
+        bytes_read += len;
+    }
+    thread.join();
+    joined = true;
+    const end = nowNs(reporter.io);
+
+    if (writer_args.err) |err| return err;
+    if (bytes_read != case.total_bytes) return error.UnexpectedNetworkRead;
+    if (writer_args.bytes_written != case.total_bytes) return error.UnexpectedNetworkWrite;
+
+    return end - start;
+}
+
+const RawPosixVectoredSocketWriterArgs = struct {
+    fd: posix.fd_t,
+    total_bytes: usize,
+    chunk: []const u8,
+    start: *std.atomic.Value(bool),
+    bytes_written: usize = 0,
+    err: ?anyerror = null,
+};
+
+fn rawPosixVectoredSocketWriter(args: *RawPosixVectoredSocketWriterArgs) void {
+    rawPosixVectoredSocketWriterRun(args) catch |err| {
+        args.err = err;
+    };
+}
+
+fn rawPosixVectoredSocketWriterRun(args: *RawPosixVectoredSocketWriterArgs) !void {
+    while (!args.start.load(.acquire)) std.atomic.spinLoopHint();
+
+    var total: usize = 0;
+    while (total < args.total_bytes) {
+        const remaining = args.total_bytes - total;
+        const len = @min(args.chunk.len, remaining);
+        try rawSendmsgAll(args.fd, args.chunk[0..len]);
+        total += len;
+    }
+    args.bytes_written = total;
+}
+
+fn measureRawPosixVectoredSocketThroughput(reporter: Reporter, _: Options, case: SocketThroughputCase) !i96 {
+    if (!@hasDecl(posix.system, "socketpair")) return error.UnsupportedBenchmark;
+
+    var sockets: [2]posix.fd_t = undefined;
+    switch (posix.errno(posix.system.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sockets))) {
+        .SUCCESS => {},
+        else => return error.UnsupportedBenchmark,
+    }
+    defer closeFd(sockets[0]);
+    defer closeFd(sockets[1]);
+
+    const write_chunk = try std.heap.page_allocator.alloc(u8, case.chunk_size);
+    defer std.heap.page_allocator.free(write_chunk);
+    const read_buffer = try std.heap.page_allocator.alloc(u8, case.chunk_size);
+    defer std.heap.page_allocator.free(read_buffer);
+    @memset(write_chunk, 't');
+
+    var start_gate = std.atomic.Value(bool).init(false);
+    var writer_args: RawPosixVectoredSocketWriterArgs = .{
+        .fd = sockets[1],
+        .total_bytes = case.total_bytes,
+        .chunk = write_chunk,
+        .start = &start_gate,
+    };
+
+    const thread = try std.Thread.spawn(.{}, rawPosixVectoredSocketWriter, .{&writer_args});
+    var joined = false;
+    defer if (!joined) thread.join();
+
+    var bytes_read: usize = 0;
+    const start = nowNs(reporter.io);
+    start_gate.store(true, .release);
+    while (bytes_read < case.total_bytes) {
+        const remaining = case.total_bytes - bytes_read;
+        const len = @min(read_buffer.len, remaining);
+        try rawReadvAll(sockets[0], read_buffer[0..len]);
+        bytes_read += len;
+    }
+    thread.join();
+    joined = true;
+    const end = nowNs(reporter.io);
+
+    if (writer_args.err) |err| return err;
+    if (bytes_read != case.total_bytes) return error.UnexpectedNetworkRead;
+    if (writer_args.bytes_written != case.total_bytes) return error.UnexpectedNetworkWrite;
+
+    return end - start;
+}
+
+fn measureRawPosixNonblockingPumpSocketThroughput(reporter: Reporter, _: Options, case: SocketThroughputCase) !i96 {
+    if (!@hasDecl(posix.system, "socketpair")) return error.UnsupportedBenchmark;
+
+    var sockets: [2]posix.fd_t = undefined;
+    switch (posix.errno(posix.system.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sockets))) {
+        .SUCCESS => {},
+        else => return error.UnsupportedBenchmark,
+    }
+    defer closeFd(sockets[0]);
+    defer closeFd(sockets[1]);
+    try setNonblocking(sockets[0]);
+    try setNonblocking(sockets[1]);
+
+    const write_chunk = try std.heap.page_allocator.alloc(u8, case.chunk_size);
+    defer std.heap.page_allocator.free(write_chunk);
+    const read_buffer = try std.heap.page_allocator.alloc(u8, case.chunk_size);
+    defer std.heap.page_allocator.free(read_buffer);
+    @memset(write_chunk, 't');
+
+    var bytes_written: usize = 0;
+    var bytes_read: usize = 0;
+
+    const start = nowNs(reporter.io);
+    while (bytes_read < case.total_bytes) {
+        var progressed = false;
+
+        if (bytes_written < case.total_bytes) {
+            const remaining = case.total_bytes - bytes_written;
+            const len = @min(write_chunk.len, remaining);
+            const written = rawWriteNonblocking(sockets[1], write_chunk[0..len]) catch |err| switch (err) {
+                error.WouldBlock => 0,
+                else => |e| return e,
+            };
+            bytes_written += written;
+            progressed = progressed or written != 0;
+        }
+
+        if (bytes_read < case.total_bytes) {
+            const remaining = case.total_bytes - bytes_read;
+            const len = @min(read_buffer.len, remaining);
+            const read = rawReadNonblocking(sockets[0], read_buffer[0..len]) catch |err| switch (err) {
+                error.WouldBlock => 0,
+                else => |e| return e,
+            };
+            bytes_read += read;
+            progressed = progressed or read != 0;
+        }
+
+        if (!progressed) try pollSocketPair(sockets);
+    }
+    const end = nowNs(reporter.io);
+
+    if (bytes_written != case.total_bytes) return error.UnexpectedNetworkWrite;
+    if (bytes_read != case.total_bytes) return error.UnexpectedNetworkRead;
+
+    return end - start;
+}
+
+fn rawReadAll(fd: posix.fd_t, buffer: []u8) !void {
+    var offset: usize = 0;
+    while (offset < buffer.len) {
+        const n = try rawRead(fd, buffer[offset..]);
+        if (n == 0) return error.UnexpectedEndOfStream;
+        offset += n;
+    }
+}
+
+fn rawWriteAll(fd: posix.fd_t, buffer: []const u8) !void {
+    var offset: usize = 0;
+    while (offset < buffer.len) {
+        const n = try rawWrite(fd, buffer[offset..]);
+        if (n == 0) return error.UnexpectedEndOfStream;
+        offset += n;
+    }
+}
+
+fn rawReadvAll(fd: posix.fd_t, buffer: []u8) !void {
+    var offset: usize = 0;
+    while (offset < buffer.len) {
+        const n = try rawReadv(fd, buffer[offset..]);
+        if (n == 0) return error.UnexpectedEndOfStream;
+        offset += n;
+    }
+}
+
+fn rawSendmsgAll(fd: posix.fd_t, buffer: []const u8) !void {
+    var offset: usize = 0;
+    while (offset < buffer.len) {
+        const n = try rawSendmsg(fd, buffer[offset..]);
+        if (n == 0) return error.UnexpectedEndOfStream;
+        offset += n;
+    }
+}
+
+fn rawRead(fd: posix.fd_t, buffer: []u8) !usize {
+    while (true) {
+        const rc = posix.system.read(fd, buffer.ptr, buffer.len);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            else => return error.Unexpected,
+        }
+    }
+}
+
+fn rawWrite(fd: posix.fd_t, buffer: []const u8) !usize {
+    while (true) {
+        const rc = posix.system.write(fd, buffer.ptr, buffer.len);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            else => return error.Unexpected,
+        }
+    }
+}
+
+fn rawReadNonblocking(fd: posix.fd_t, buffer: []u8) !usize {
+    const rc = posix.system.read(fd, buffer.ptr, buffer.len);
+    return switch (posix.errno(rc)) {
+        .SUCCESS => @intCast(rc),
+        .INTR => rawReadNonblocking(fd, buffer),
+        .AGAIN => error.WouldBlock,
+        else => error.Unexpected,
+    };
+}
+
+fn rawWriteNonblocking(fd: posix.fd_t, buffer: []const u8) !usize {
+    const rc = posix.system.write(fd, buffer.ptr, buffer.len);
+    return switch (posix.errno(rc)) {
+        .SUCCESS => @intCast(rc),
+        .INTR => rawWriteNonblocking(fd, buffer),
+        .AGAIN => error.WouldBlock,
+        else => error.Unexpected,
+    };
+}
+
+fn rawReadv(fd: posix.fd_t, buffer: []u8) !usize {
+    var iovec: [1]posix.iovec = .{.{
+        .base = buffer.ptr,
+        .len = buffer.len,
+    }};
+
+    while (true) {
+        const rc = posix.system.readv(fd, &iovec, iovec.len);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            else => return error.Unexpected,
+        }
+    }
+}
+
+fn rawSendmsg(fd: posix.fd_t, buffer: []const u8) !usize {
+    var iovec: [1]posix.iovec_const = .{.{
+        .base = buffer.ptr,
+        .len = buffer.len,
+    }};
+    var msg: posix.msghdr_const = .{
+        .name = null,
+        .namelen = 0,
+        .iov = &iovec,
+        .iovlen = iovec.len,
+        .control = null,
+        .controllen = 0,
+        .flags = 0,
+    };
+
+    while (true) {
+        const rc = posix.system.sendmsg(fd, &msg, 0);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            else => return error.Unexpected,
+        }
+    }
+}
+
+fn pollSocketPair(sockets: [2]posix.fd_t) !void {
+    var pollfds = [_]posix.pollfd{
+        .{
+            .fd = sockets[0],
+            .events = @intCast(posix.POLL.IN),
+            .revents = 0,
+        },
+        .{
+            .fd = sockets[1],
+            .events = @intCast(posix.POLL.OUT),
+            .revents = 0,
+        },
+    };
+    _ = try posix.poll(&pollfds, -1);
 }
 
 fn streamFromFd(fd: std.posix.fd_t) std.Io.net.Stream {
