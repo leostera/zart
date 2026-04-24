@@ -39,7 +39,7 @@ const ActorState = enum(u8) {
     failed,
 };
 
-const WaitReason = union(enum) {
+const WaitReason = enum(u8) {
     none,
     recv,
     io,
@@ -51,7 +51,7 @@ const ActorHeader = struct {
     owner_worker: usize,
     msg_type: usize,
     state: std.atomic.Value(ActorState),
-    wait_reason: WaitReason,
+    wait_reason: std.atomic.Value(WaitReason),
     queued: std.atomic.Value(bool),
     budget_remaining: usize,
     io_budget_remaining: usize,
@@ -72,6 +72,14 @@ const ActorHeader = struct {
 
     fn exchangeState(header: *ActorHeader, state: ActorState) ActorState {
         return header.state.swap(state, .acq_rel);
+    }
+
+    fn loadWaitReason(header: *const ActorHeader) WaitReason {
+        return header.wait_reason.load(.acquire);
+    }
+
+    fn storeWaitReason(header: *ActorHeader, reason: WaitReason) void {
+        header.wait_reason.store(reason, .release);
     }
 };
 
@@ -221,7 +229,7 @@ pub const Runtime = struct {
         if (ready.loadState() != .runnable) return true;
 
         ready.storeState(.running);
-        ready.wait_reason = .none;
+        ready.storeWaitReason(.none);
         ready.budget_remaining = rt.executionBudget();
         ready.io_budget_remaining = rt.ioBudget();
         rt.traceActorResumed(ready.id);
@@ -375,9 +383,9 @@ pub const Runtime = struct {
     fn wake(rt: *Runtime, target: *ActorHeader) void {
         switch (target.loadState()) {
             .waiting => {
-                switch (target.wait_reason) {
+                switch (target.loadWaitReason()) {
                     .recv => {
-                        target.wait_reason = .none;
+                        target.storeWaitReason(.none);
                         target.storeState(.runnable);
                         rt.enqueue(target);
                     },
@@ -418,10 +426,10 @@ pub const Runtime = struct {
         while (rt.io.popCompletion()) |request| {
             const target: *ActorHeader = @ptrCast(@alignCast(request.actor));
             switch (target.loadState()) {
-                .waiting => switch (target.wait_reason) {
+                .waiting => switch (target.loadWaitReason()) {
                     .io => {
                         rt.traceActorIoCompleted(target.id);
-                        target.wait_reason = .none;
+                        target.storeWaitReason(.none);
                         target.storeState(.runnable);
                         rt.enqueue(target);
                     },
@@ -452,7 +460,7 @@ pub const Runtime = struct {
         }
 
         target.io_budget_remaining = 0;
-        target.wait_reason = .none;
+        target.storeWaitReason(.none);
         target.storeState(.runnable);
         rt.traceActorYielded(target.id);
         rt.enqueue(target);
@@ -518,9 +526,9 @@ fn chargeActorIo(runtime: *anyopaque, actor_header: *anyopaque) void {
 fn parkActorIo(runtime: *anyopaque, actor_header: *anyopaque) void {
     const rt: *Runtime = @ptrCast(@alignCast(runtime));
     const target: *ActorHeader = @ptrCast(@alignCast(actor_header));
-    if (target.wait_reason != .io) rt.traceActorIoSubmitted(target.id);
+    if (target.loadWaitReason() != .io) rt.traceActorIoSubmitted(target.id);
     rt.traceActorWaiting(target.id);
-    target.wait_reason = .io;
+    target.storeWaitReason(.io);
     target.storeState(.waiting);
     Fiber.yield();
 }
@@ -550,10 +558,10 @@ pub fn Ctx(comptime Msg: type) type {
                 }
 
                 ctx.runtime.traceActorWaiting(ctx.actor.id);
-                ctx.actor.wait_reason = .recv;
+                ctx.actor.storeWaitReason(.recv);
                 ctx.actor.storeState(.waiting);
                 if (ctx.inbox.pop()) |msg| {
-                    ctx.actor.wait_reason = .none;
+                    ctx.actor.storeWaitReason(.none);
                     ctx.actor.storeState(.running);
                     ctx.runtime.traceMessageReceived(ctx.actor.id);
                     return msg;
@@ -574,7 +582,7 @@ pub fn Ctx(comptime Msg: type) type {
 
             ctx.actor.budget_remaining = 0;
             ctx.runtime.traceActorYielded(ctx.actor.id);
-            ctx.actor.wait_reason = .none;
+            ctx.actor.storeWaitReason(.none);
             ctx.actor.storeState(.runnable);
             ctx.runtime.enqueue(ctx.actor);
             Fiber.yield();
@@ -617,7 +625,7 @@ fn FunctionActorCell(comptime Msg: type, comptime entry: anytype) type {
                     .owner_worker = owner_worker,
                     .msg_type = typeId(Msg),
                     .state = .init(.runnable),
-                    .wait_reason = .none,
+                    .wait_reason = .init(.none),
                     .queued = .init(false),
                     .budget_remaining = 0,
                     .io_budget_remaining = 0,
@@ -679,7 +687,7 @@ fn StructActorCell(comptime Msg: type, comptime ActorType: type) type {
                     .owner_worker = owner_worker,
                     .msg_type = typeId(Msg),
                     .state = .init(.runnable),
-                    .wait_reason = .none,
+                    .wait_reason = .init(.none),
                     .queued = .init(false),
                     .budget_remaining = 0,
                     .io_budget_remaining = 0,
