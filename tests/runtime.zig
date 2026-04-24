@@ -3,6 +3,7 @@ comptime {
     _ = @import("runtime/io.zig");
     _ = @import("runtime/properties.zig");
     _ = @import("runtime/scheduler.zig");
+    _ = @import("runtime/smp.zig");
     _ = @import("runtime/spawn.zig");
     _ = @import("runtime/stress.zig");
     _ = @import("runtime/tracing.zig");
