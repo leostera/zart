@@ -1,6 +1,7 @@
 const common = @import("common.zig");
 const std = common.std;
 const Ctx = common.Ctx;
+const DefaultIo = common.DefaultIo;
 const IoDriver = common.IoDriver;
 const IoRequest = common.IoRequest;
 const Runtime = common.Runtime;
@@ -464,4 +465,165 @@ test "std Io batch waits park actor until non-blocking driver completion" {
     try testing.expectEqualStrings("abcd", trace.slice());
     try testing.expectEqual(@as(usize, 1), fake_driver.async_calls);
     try testing.expectEqual(@as(usize, 1), fake_driver.concurrent_calls);
+}
+
+test "posix io driver reads files through ctx io" {
+    const testing = std.testing;
+
+    const FileReadMsg = union(enum) {
+        read: std.Io.File,
+    };
+
+    const Reader = struct {
+        pub const Msg = FileReadMsg;
+
+        out: *[5]u8,
+        len: *usize,
+
+        pub fn run(self: *@This(), ctx: *Ctx(Msg)) !void {
+            switch (try ctx.recv()) {
+                .read => |file| {
+                    var buffers = [_][]u8{self.out[0..]};
+                    self.len.* = try file.readPositional(ctx.io(), &buffers, 0);
+                },
+            }
+        }
+    };
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var file = try tmp.dir.createFile(testing.io, "input.txt", .{ .read = true });
+    defer file.close(testing.io);
+    try file.writeStreamingAll(testing.io, "hello");
+
+    var posix_io = DefaultIo.init();
+    defer posix_io.deinit();
+
+    var rt = try Runtime.init(testing.allocator, .{ .io = posix_io.driver() });
+    defer rt.deinit();
+
+    var out: [5]u8 = undefined;
+    var len: usize = 0;
+    const reader = try rt.spawn(Reader{ .out = &out, .len = &len });
+
+    try reader.send(.{ .read = file });
+    try rt.run();
+
+    try testing.expectEqualStrings("hello", out[0..len]);
+}
+
+test "posix io driver parks socket reads until another actor writes" {
+    const testing = std.testing;
+
+    if (!@hasDecl(std.posix.system, "socketpair")) return error.SkipZigTest;
+
+    var sockets: [2]std.posix.fd_t = undefined;
+    switch (std.posix.errno(std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &sockets))) {
+        .SUCCESS => {},
+        else => return error.SkipZigTest,
+    }
+    defer closeFd(sockets[0]);
+    defer closeFd(sockets[1]);
+    try setNonblocking(sockets[0]);
+    try setNonblocking(sockets[1]);
+
+    const ReadMsg = union(enum) {
+        start,
+    };
+    const WriteMsg = union(enum) {
+        start,
+    };
+
+    const Actors = struct {
+        const Reader = struct {
+            pub const Msg = ReadMsg;
+
+            stream: std.Io.net.Stream,
+            out: *[4]u8,
+            len: *usize,
+
+            pub fn run(self: *@This(), ctx: *Ctx(Msg)) !void {
+                switch (try ctx.recv()) {
+                    .start => {
+                        var buffer: [8]u8 = undefined;
+                        var reader = self.stream.reader(ctx.io(), &buffer);
+                        self.len.* = try reader.interface.readSliceShort(self.out[0..]);
+                    },
+                }
+            }
+        };
+
+        const Writer = struct {
+            pub const Msg = WriteMsg;
+
+            stream: std.Io.net.Stream,
+
+            pub fn run(self: *@This(), ctx: *Ctx(Msg)) !void {
+                switch (try ctx.recv()) {
+                    .start => {
+                        var buffer: [8]u8 = undefined;
+                        var writer = self.stream.writer(ctx.io(), &buffer);
+                        try writer.interface.writeAll("pong");
+                        try writer.interface.flush();
+                    },
+                }
+            }
+        };
+    };
+
+    var posix_io = DefaultIo.init();
+    defer posix_io.deinit();
+
+    var rt = try Runtime.init(testing.allocator, .{ .io = posix_io.driver() });
+    defer rt.deinit();
+
+    var out: [4]u8 = undefined;
+    var len: usize = 0;
+    const reader = try rt.spawn(Actors.Reader{
+        .stream = streamFromFd(sockets[0]),
+        .out = &out,
+        .len = &len,
+    });
+    const writer = try rt.spawn(Actors.Writer{
+        .stream = streamFromFd(sockets[1]),
+    });
+
+    try reader.send(.start);
+    try writer.send(.start);
+    try rt.run();
+
+    try testing.expectEqualStrings("pong", out[0..len]);
+}
+
+fn streamFromFd(fd: std.posix.fd_t) std.Io.net.Stream {
+    return .{
+        .socket = .{
+            .handle = fd,
+            .address = .{ .ip4 = .loopback(0) },
+        },
+    };
+}
+
+fn closeFd(fd: std.posix.fd_t) void {
+    _ = std.posix.system.close(fd);
+}
+
+fn setNonblocking(fd: std.posix.fd_t) !void {
+    var flags: usize = while (true) {
+        const rc = std.posix.system.fcntl(fd, std.posix.F.GETFL, @as(usize, 0));
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => break @intCast(rc),
+            .INTR => continue,
+            else => return error.Unexpected,
+        }
+    };
+    flags |= @as(usize, 1 << @bitOffsetOf(std.posix.O, "NONBLOCK"));
+    while (true) {
+        switch (std.posix.errno(std.posix.system.fcntl(fd, std.posix.F.SETFL, flags))) {
+            .SUCCESS => return,
+            .INTR => continue,
+            else => return error.Unexpected,
+        }
+    }
 }

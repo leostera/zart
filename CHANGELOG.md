@@ -17,6 +17,7 @@ This project is still pre-release. Entries are grouped under `Unreleased` until 
 - Added stackful `Fiber` support for `aarch64` and `x86_64` non-Windows targets.
 - Added pooled actor stacks with optional first-slab preallocation at runtime construction.
 - Added non-blocking actor I/O facade over Zig `std.Io` operations through runtime-provided drivers.
+- Added `zart.io.Default` comptime backend selection and a POSIX readiness/retry backend for file and stream socket reads/writes.
 - Added runtime tracing events for actor lifecycle, scheduling, message sends/receives, failures, and I/O submission/completion.
 - Added `zart.testing` utilities for deterministic actor interleaving tests.
 - Added external runtime test modules under `tests/runtime/`.

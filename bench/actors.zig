@@ -99,6 +99,75 @@ const IoBenchActor = struct {
     }
 };
 
+const FileReadMsg = union(enum) {
+    read: struct {
+        file: std.Io.File,
+        operations: usize,
+        total_read: *usize,
+    },
+};
+
+const FileReadActor = struct {
+    pub const Msg = FileReadMsg;
+
+    pub fn run(_: *@This(), ctx: *zart.Ctx(Msg)) !void {
+        switch (try ctx.recv()) {
+            .read => |request| {
+                var buffer: [4096]u8 = undefined;
+                var buffers = [_][]u8{buffer[0..]};
+                var total: usize = 0;
+                for (0..request.operations) |_| {
+                    total += try request.file.readPositional(ctx.io(), &buffers, 0);
+                }
+                request.total_read.* = total;
+            },
+        }
+    }
+};
+
+const SocketReadMsg = union(enum) {
+    read: struct {
+        stream: std.Io.net.Stream,
+        data: []u8,
+    },
+};
+
+const SocketReadActor = struct {
+    pub const Msg = SocketReadMsg;
+
+    pub fn run(_: *@This(), ctx: *zart.Ctx(Msg)) !void {
+        switch (try ctx.recv()) {
+            .read => |request| {
+                var buffer: [4096]u8 = undefined;
+                var reader = request.stream.reader(ctx.io(), &buffer);
+                try reader.interface.readSliceAll(request.data);
+            },
+        }
+    }
+};
+
+const SocketWriteMsg = union(enum) {
+    write: struct {
+        stream: std.Io.net.Stream,
+        data: []const u8,
+    },
+};
+
+const SocketWriteActor = struct {
+    pub const Msg = SocketWriteMsg;
+
+    pub fn run(_: *@This(), ctx: *zart.Ctx(Msg)) !void {
+        switch (try ctx.recv()) {
+            .write => |request| {
+                var buffer: [4096]u8 = undefined;
+                var writer = request.stream.writer(ctx.io(), &buffer);
+                try writer.interface.writeAll(request.data);
+                try writer.interface.flush();
+            },
+        }
+    }
+};
+
 const ImmediateIoDriver = struct {
     completed: usize = 0,
 
@@ -116,6 +185,11 @@ const ImmediateIoDriver = struct {
         self.completed += 1;
         switch (request.payload) {
             .operate => request.completeOperate(.{ .file_read_streaming = 0 }),
+            .file_read_positional,
+            .file_write_positional,
+            .net_read,
+            .net_write,
+            => unreachable,
             .sleep => request.completeSleep({}),
             .batch_await_async => request.completeBatchAwaitAsync({}),
             .batch_await_concurrent => request.completeBatchAwaitConcurrent({}),
@@ -617,8 +691,27 @@ fn benchIo(reporter: Reporter, options: Options) !void {
         try runMeasured(reporter, options, name, operation_count, operation_count, measureIo);
     }
 
-    try reporter.skip("read files", "pending concrete non-blocking file driver");
-    try reporter.skip("read network", "pending concrete non-blocking network driver");
+    const file_cases = if (options.quick)
+        &[_]usize{ 100, 1_000 }
+    else
+        &[_]usize{ 1_000, 10_000 };
+    for (file_cases) |operation_count| {
+        const name = try std.fmt.allocPrint(std.heap.page_allocator, "read file ops {d}", .{operation_count});
+        defer std.heap.page_allocator.free(name);
+
+        try runMeasured(reporter, options, name, operation_count, operation_count, measureFileRead);
+    }
+
+    const network_cases = if (options.quick)
+        &[_]usize{ 1_000, 10_000 }
+    else
+        &[_]usize{ 10_000, 100_000 };
+    for (network_cases) |byte_count| {
+        const name = try std.fmt.allocPrint(std.heap.page_allocator, "socket read/write bytes {d}", .{byte_count});
+        defer std.heap.page_allocator.free(name);
+
+        try runMeasured(reporter, options, name, byte_count, byte_count, measureSocketReadWrite);
+    }
 }
 
 fn measureIo(reporter: Reporter, options: Options, operation_count: usize) !i96 {
@@ -643,6 +736,126 @@ fn measureIo(reporter: Reporter, options: Options, operation_count: usize) !i96 
     try rt.run();
 
     return end - start;
+}
+
+fn measureFileRead(reporter: Reporter, options: Options, operation_count: usize) !i96 {
+    var cache_dir = try std.Io.Dir.cwd().createDirPathOpen(reporter.io, ".zig-cache/tmp", .{});
+    defer cache_dir.close(reporter.io);
+
+    var file = try cache_dir.createFile(reporter.io, "zart-actor-bench-read.bin", .{ .read = true });
+    defer file.close(reporter.io);
+
+    var contents: [4096]u8 = undefined;
+    @memset(&contents, 'z');
+    try file.writeStreamingAll(reporter.io, &contents);
+
+    var driver = zart.io.Default.init();
+    defer driver.deinit();
+
+    var rt = try zart.Runtime.init(std.heap.page_allocator, .{
+        .stack_size = options.stack_size,
+        .internal_allocator = std.heap.page_allocator,
+        .io = driver.driver(),
+    });
+    defer rt.deinit();
+
+    var total_read: usize = 0;
+    const actor = try rt.spawn(FileReadActor{});
+    try actor.send(.{ .read = .{
+        .file = file,
+        .operations = operation_count,
+        .total_read = &total_read,
+    } });
+
+    const start = nowNs(reporter.io);
+    try rt.run();
+    const end = nowNs(reporter.io);
+
+    if (total_read != operation_count * contents.len) return error.UnexpectedFileReadCount;
+
+    return end - start;
+}
+
+fn measureSocketReadWrite(reporter: Reporter, options: Options, byte_count: usize) !i96 {
+    if (!@hasDecl(std.posix.system, "socketpair")) return error.UnsupportedBenchmark;
+
+    var sockets: [2]std.posix.fd_t = undefined;
+    switch (std.posix.errno(std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &sockets))) {
+        .SUCCESS => {},
+        else => return error.UnsupportedBenchmark,
+    }
+    defer closeFd(sockets[0]);
+    defer closeFd(sockets[1]);
+    try setNonblocking(sockets[0]);
+    try setNonblocking(sockets[1]);
+
+    const write_data = try std.heap.page_allocator.alloc(u8, byte_count);
+    defer std.heap.page_allocator.free(write_data);
+    const read_data = try std.heap.page_allocator.alloc(u8, byte_count);
+    defer std.heap.page_allocator.free(read_data);
+    @memset(write_data, 'n');
+
+    var driver = zart.io.Default.init();
+    defer driver.deinit();
+
+    var rt = try zart.Runtime.init(std.heap.page_allocator, .{
+        .stack_size = options.stack_size,
+        .internal_allocator = std.heap.page_allocator,
+        .io = driver.driver(),
+    });
+    defer rt.deinit();
+
+    const reader = try rt.spawn(SocketReadActor{});
+    const writer = try rt.spawn(SocketWriteActor{});
+
+    try reader.send(.{ .read = .{
+        .stream = streamFromFd(sockets[0]),
+        .data = read_data,
+    } });
+    try writer.send(.{ .write = .{
+        .stream = streamFromFd(sockets[1]),
+        .data = write_data,
+    } });
+
+    const start = nowNs(reporter.io);
+    try rt.run();
+    const end = nowNs(reporter.io);
+
+    if (!std.mem.eql(u8, write_data, read_data)) return error.UnexpectedNetworkRead;
+
+    return end - start;
+}
+
+fn streamFromFd(fd: std.posix.fd_t) std.Io.net.Stream {
+    return .{
+        .socket = .{
+            .handle = fd,
+            .address = .{ .ip4 = .loopback(0) },
+        },
+    };
+}
+
+fn closeFd(fd: std.posix.fd_t) void {
+    _ = std.posix.system.close(fd);
+}
+
+fn setNonblocking(fd: std.posix.fd_t) !void {
+    var flags: usize = while (true) {
+        const rc = std.posix.system.fcntl(fd, std.posix.F.GETFL, @as(usize, 0));
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => break @intCast(rc),
+            .INTR => continue,
+            else => return error.Unexpected,
+        }
+    };
+    flags |= @as(usize, 1 << @bitOffsetOf(std.posix.O, "NONBLOCK"));
+    while (true) {
+        switch (std.posix.errno(std.posix.system.fcntl(fd, std.posix.F.SETFL, flags))) {
+            .SUCCESS => return,
+            .INTR => continue,
+            else => return error.Unexpected,
+        }
+    }
 }
 
 fn nowNs(io: std.Io) i96 {

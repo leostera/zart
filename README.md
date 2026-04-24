@@ -132,6 +132,19 @@ Actor I/O is non-blocking by runtime contract. `ctx.io()` returns a `std.Io` fac
 
 The driver must not block the scheduler. It can complete requests immediately or retain them and complete them later from a poller/event callback.
 
+The default backend is selected at comptime through `zart.io.Default`:
+
+```zig
+var actor_io = zart.io.Default.init();
+defer actor_io.deinit();
+
+var rt = try zart.Runtime.init(allocator, .{
+    .io = actor_io.driver(),
+});
+```
+
+On POSIX targets, `zart.io.Default` retries non-blocking file and stream socket reads/writes internally. If an operation returns `WouldBlock`, the actor is parked until readiness is reported and then resumed with the completed result.
+
 ## Tracing
 
 Pass `Runtime.Options.tracer` to observe runtime events without changing actor code. When no tracer is configured, trace event construction is skipped at the call sites.

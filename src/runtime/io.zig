@@ -15,10 +15,21 @@ pub const RuntimeIo = struct {
     pub const Driver = struct {
         context: ?*anyopaque = null,
         submit_fn: *const fn (?*anyopaque, *Request) void,
+        poll_fn: ?*const fn (?*anyopaque, PollMode) anyerror!void = null,
 
         pub fn submit(driver: Driver, request: *Request) void {
             driver.submit_fn(driver.context, request);
         }
+
+        pub fn poll(driver: Driver, mode: PollMode) !void {
+            const poll_fn = driver.poll_fn orelse return;
+            try poll_fn(driver.context, mode);
+        }
+    };
+
+    pub const PollMode = enum {
+        nonblocking,
+        wait,
     };
 
     pub const Request = struct {
@@ -31,6 +42,10 @@ pub const RuntimeIo = struct {
 
         pub const Payload = union(enum) {
             operate: Operate,
+            file_read_positional: FileReadPositional,
+            file_write_positional: FileWritePositional,
+            net_read: NetRead,
+            net_write: NetWrite,
             batch_await_async: BatchAwaitAsync,
             batch_await_concurrent: BatchAwaitConcurrent,
             sleep: Sleep,
@@ -39,6 +54,36 @@ pub const RuntimeIo = struct {
         pub const Operate = struct {
             operation: std.Io.Operation,
             result: std.Io.Cancelable!std.Io.Operation.Result = undefined,
+        };
+
+        pub const FileReadPositional = struct {
+            file: std.Io.File,
+            data: []const []u8,
+            offset: u64,
+            result: std.Io.File.ReadPositionalError!usize = undefined,
+        };
+
+        pub const FileWritePositional = struct {
+            file: std.Io.File,
+            header: []const u8,
+            data: []const []const u8,
+            splat: usize,
+            offset: u64,
+            result: std.Io.File.WritePositionalError!usize = undefined,
+        };
+
+        pub const NetRead = struct {
+            handle: std.Io.net.Socket.Handle,
+            data: [][]u8,
+            result: std.Io.net.Stream.Reader.Error!usize = undefined,
+        };
+
+        pub const NetWrite = struct {
+            handle: std.Io.net.Socket.Handle,
+            header: []const u8,
+            data: []const []const u8,
+            splat: usize,
+            result: std.Io.net.Stream.Writer.Error!usize = undefined,
         };
 
         pub const Sleep = struct {
@@ -62,6 +107,73 @@ pub const RuntimeIo = struct {
                 .actor = actor,
                 .payload = .{
                     .operate = .{ .operation = operation },
+                },
+            };
+        }
+
+        pub fn initFileReadPositional(actor: *anyopaque, file: std.Io.File, data: []const []u8, offset: u64) Request {
+            return .{
+                .actor = actor,
+                .payload = .{
+                    .file_read_positional = .{
+                        .file = file,
+                        .data = data,
+                        .offset = offset,
+                    },
+                },
+            };
+        }
+
+        pub fn initFileWritePositional(
+            actor: *anyopaque,
+            file: std.Io.File,
+            header: []const u8,
+            data: []const []const u8,
+            splat: usize,
+            offset: u64,
+        ) Request {
+            return .{
+                .actor = actor,
+                .payload = .{
+                    .file_write_positional = .{
+                        .file = file,
+                        .header = header,
+                        .data = data,
+                        .splat = splat,
+                        .offset = offset,
+                    },
+                },
+            };
+        }
+
+        pub fn initNetRead(actor: *anyopaque, handle: std.Io.net.Socket.Handle, data: [][]u8) Request {
+            return .{
+                .actor = actor,
+                .payload = .{
+                    .net_read = .{
+                        .handle = handle,
+                        .data = data,
+                    },
+                },
+            };
+        }
+
+        pub fn initNetWrite(
+            actor: *anyopaque,
+            handle: std.Io.net.Socket.Handle,
+            header: []const u8,
+            data: []const []const u8,
+            splat: usize,
+        ) Request {
+            return .{
+                .actor = actor,
+                .payload = .{
+                    .net_write = .{
+                        .handle = handle,
+                        .header = header,
+                        .data = data,
+                        .splat = splat,
+                    },
                 },
             };
         }
@@ -98,6 +210,26 @@ pub const RuntimeIo = struct {
 
         pub fn completeOperate(request: *Request, result: std.Io.Cancelable!std.Io.Operation.Result) void {
             request.payload.operate.result = result;
+            request.complete();
+        }
+
+        pub fn completeFileReadPositional(request: *Request, result: std.Io.File.ReadPositionalError!usize) void {
+            request.payload.file_read_positional.result = result;
+            request.complete();
+        }
+
+        pub fn completeFileWritePositional(request: *Request, result: std.Io.File.WritePositionalError!usize) void {
+            request.payload.file_write_positional.result = result;
+            request.complete();
+        }
+
+        pub fn completeNetRead(request: *Request, result: std.Io.net.Stream.Reader.Error!usize) void {
+            request.payload.net_read.result = result;
+            request.complete();
+        }
+
+        pub fn completeNetWrite(request: *Request, result: std.Io.net.Stream.Writer.Error!usize) void {
+            request.payload.net_write.result = result;
             request.complete();
         }
 
@@ -187,6 +319,16 @@ pub const RuntimeIo = struct {
         request.completed.store(false, .monotonic);
 
         driver.submit(request);
+    }
+
+    pub fn hasPoller(runtime_io: *const RuntimeIo) bool {
+        const driver = runtime_io.shared.driver orelse return false;
+        return driver.poll_fn != null;
+    }
+
+    pub fn poll(runtime_io: *RuntimeIo, mode: PollMode) !void {
+        const driver = runtime_io.shared.driver orelse return;
+        try driver.poll(mode);
     }
 
     pub fn popCompletion(runtime_io: *RuntimeIo) ?*Request {
@@ -299,6 +441,10 @@ const actor_io_vtable: std.Io.VTable = blk: {
     vtable.batchAwaitAsync = actorIoBatchAwaitAsync;
     vtable.batchAwaitConcurrent = actorIoBatchAwaitConcurrent;
     vtable.batchCancel = actorIoBatchCancel;
+    vtable.fileReadPositional = actorIoFileReadPositional;
+    vtable.fileWritePositional = actorIoFileWritePositional;
+    vtable.netRead = actorIoNetRead;
+    vtable.netWrite = actorIoNetWrite;
     vtable.sleep = actorIoSleep;
     vtable.random = actorIoRandom;
     vtable.randomSecure = actorIoRandomSecure;
@@ -465,6 +611,80 @@ fn actorIoBatchCancel(userdata: ?*anyopaque, batch: *std.Io.Batch) void {
     defer context.charge();
     const base = context.runtime_io.baseIo();
     return base.vtable.batchCancel(base.userdata, batch);
+}
+
+fn actorIoFileReadPositional(
+    userdata: ?*anyopaque,
+    file: std.Io.File,
+    data: []const []u8,
+    offset: u64,
+) std.Io.File.ReadPositionalError!usize {
+    const context = actorIoContext(userdata);
+    if (context.runtime_io.hasDriver()) {
+        var request: RuntimeIo.Request = .initFileReadPositional(context.charge_actor, file, data, offset);
+        context.wait(&request);
+        return request.payload.file_read_positional.result;
+    }
+
+    defer context.charge();
+    const base = context.runtime_io.baseIo();
+    return base.vtable.fileReadPositional(base.userdata, file, data, offset);
+}
+
+fn actorIoFileWritePositional(
+    userdata: ?*anyopaque,
+    file: std.Io.File,
+    header: []const u8,
+    data: []const []const u8,
+    splat: usize,
+    offset: u64,
+) std.Io.File.WritePositionalError!usize {
+    const context = actorIoContext(userdata);
+    if (context.runtime_io.hasDriver()) {
+        var request: RuntimeIo.Request = .initFileWritePositional(context.charge_actor, file, header, data, splat, offset);
+        context.wait(&request);
+        return request.payload.file_write_positional.result;
+    }
+
+    defer context.charge();
+    const base = context.runtime_io.baseIo();
+    return base.vtable.fileWritePositional(base.userdata, file, header, data, splat, offset);
+}
+
+fn actorIoNetRead(
+    userdata: ?*anyopaque,
+    handle: std.Io.net.Socket.Handle,
+    data: [][]u8,
+) std.Io.net.Stream.Reader.Error!usize {
+    const context = actorIoContext(userdata);
+    if (context.runtime_io.hasDriver()) {
+        var request: RuntimeIo.Request = .initNetRead(context.charge_actor, handle, data);
+        context.wait(&request);
+        return request.payload.net_read.result;
+    }
+
+    defer context.charge();
+    const base = context.runtime_io.baseIo();
+    return base.vtable.netRead(base.userdata, handle, data);
+}
+
+fn actorIoNetWrite(
+    userdata: ?*anyopaque,
+    handle: std.Io.net.Socket.Handle,
+    header: []const u8,
+    data: []const []const u8,
+    splat: usize,
+) std.Io.net.Stream.Writer.Error!usize {
+    const context = actorIoContext(userdata);
+    if (context.runtime_io.hasDriver()) {
+        var request: RuntimeIo.Request = .initNetWrite(context.charge_actor, handle, header, data, splat);
+        context.wait(&request);
+        return request.payload.net_write.result;
+    }
+
+    defer context.charge();
+    const base = context.runtime_io.baseIo();
+    return base.vtable.netWrite(base.userdata, handle, header, data, splat);
 }
 
 fn actorIoSleep(userdata: ?*anyopaque, timeout: std.Io.Timeout) std.Io.Cancelable!void {

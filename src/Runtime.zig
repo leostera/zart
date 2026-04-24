@@ -2,6 +2,7 @@ const std = @import("std");
 const Fiber = @import("Fiber.zig");
 const actor = @import("runtime/actor.zig");
 const inbox = @import("runtime/inbox.zig");
+const concrete_io = @import("io.zig");
 const io = @import("runtime/io.zig");
 const registry = @import("runtime/registry.zig");
 const stack_pool = @import("runtime/stack_pool.zig");
@@ -18,6 +19,8 @@ pub const MessageOf = actor.MessageOf;
 pub const Io = std.Io;
 pub const IoDriver = RuntimeIo.Driver;
 pub const IoRequest = RuntimeIo.Request;
+pub const DefaultIo = concrete_io.Default;
+pub const PosixIo = concrete_io.Posix;
 
 const ActorIoContext = io.ActorIoContext;
 const RuntimeIo = io.RuntimeIo;
@@ -150,9 +153,15 @@ pub const Runtime = struct {
     /// Runs runnable actors until no runnable actor remains or an actor fails.
     pub fn run(rt: *Runtime) !void {
         while (true) {
+            try rt.pollIo(.nonblocking);
             rt.drainIoCompletions();
 
             const ready = rt.dequeue() orelse {
+                if (rt.io.hasPoller() and rt.io.hasPending()) {
+                    try rt.pollIo(.wait);
+                    rt.drainIoCompletions();
+                    continue;
+                }
                 return;
             };
 
@@ -313,6 +322,11 @@ pub const Runtime = struct {
                 .runnable, .running, .completed, .failed => {},
             }
         }
+    }
+
+    fn pollIo(rt: *Runtime, mode: RuntimeIo.PollMode) !void {
+        if (!rt.io.hasPoller()) return;
+        try rt.io.poll(mode);
     }
 
     fn executionBudget(rt: *const Runtime) usize {
