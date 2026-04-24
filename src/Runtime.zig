@@ -132,6 +132,8 @@ pub const Runtime = struct {
         stack_slab_size: usize = 4 * 1024 * 1024,
         /// Preallocate one stack slab during runtime initialization.
         preallocate_stack_slab: bool = true,
+        /// Preallocate the first actor registry slab during runtime initialization.
+        preallocate_registry_slab: bool = true,
         /// Number of explicit yield checkpoints an actor may pass per scheduler turn.
         execution_budget: usize = 64,
         /// Number of completed I/O boundaries an actor may pass per scheduler turn.
@@ -192,13 +194,16 @@ pub const Runtime = struct {
             if (options.preallocate_stack_slab) try pool.preallocateSlab();
         }
 
+        var actors: Registry = .{};
+        if (options.preallocate_registry_slab) try actors.preallocate(internal_allocator);
+
         return .{
             .allocator = allocator,
             .internal_allocator = internal_allocator,
             .options = options,
             .io = runtime_io,
             .stacks = stacks,
-            .actors = .{},
+            .actors = actors,
             .turn_mutex = .init,
             .lifetime_mutex = .init,
             .trace_mutex = .init,
@@ -630,20 +635,19 @@ pub const Runtime = struct {
         const owner = rt.ownerWorker(target);
         if (rt.currentActor()) |current| {
             if (current.owner_worker == target.owner_worker) {
-                if (owner.enqueue(rt.options.scheduler_io, target)) rt.noteRunnableQueued();
+                _ = rt.enqueueCounted(owner, target);
                 return;
             }
         }
 
-        if (owner.inject(target)) {
-            rt.noteRunnableQueued();
+        if (rt.injectCounted(owner, target)) {
             owner.notify(rt.options.scheduler_io);
         }
     }
 
     fn enqueueFromWorker(rt: *Runtime, current_worker: *Worker, target: *ActorHeader) void {
         if (current_worker.id.index == target.owner_worker) {
-            if (current_worker.enqueue(rt.options.scheduler_io, target)) rt.noteRunnableQueued();
+            _ = rt.enqueueCounted(current_worker, target);
             return;
         }
 
@@ -653,7 +657,7 @@ pub const Runtime = struct {
     fn enqueueSpawn(rt: *Runtime, target: *ActorHeader) void {
         const owner = rt.ownerWorker(target);
         if (rt.currentActor() != null or rt.state() != .running) {
-            if (owner.enqueue(rt.options.scheduler_io, target)) rt.noteRunnableQueued();
+            _ = rt.enqueueCounted(owner, target);
             return;
         }
 
@@ -676,6 +680,25 @@ pub const Runtime = struct {
 
     fn noteRunnableQueued(rt: *Runtime) void {
         _ = rt.runnable_count.fetchAdd(1, .acq_rel);
+    }
+
+    fn noteRunnableQueueCanceled(rt: *Runtime) void {
+        const previous = rt.runnable_count.fetchSub(1, .acq_rel);
+        if (previous == 0) @panic("runnable actor count underflow");
+    }
+
+    fn enqueueCounted(rt: *Runtime, owner: *Worker, target: *ActorHeader) bool {
+        rt.noteRunnableQueued();
+        if (owner.enqueue(rt.options.scheduler_io, target)) return true;
+        rt.noteRunnableQueueCanceled();
+        return false;
+    }
+
+    fn injectCounted(rt: *Runtime, owner: *Worker, target: *ActorHeader) bool {
+        rt.noteRunnableQueued();
+        if (owner.inject(target)) return true;
+        rt.noteRunnableQueueCanceled();
+        return false;
     }
 
     fn noteRunnableDequeued(rt: *Runtime) void {

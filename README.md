@@ -118,6 +118,7 @@ var rt = try zart.Runtime.init(allocator, .{
     .stack_size = 16 * 1024,
     .stack_slab_size = 4 * 1024 * 1024,
     .preallocate_stack_slab = true,
+    .preallocate_registry_slab = true,
     .execution_budget = 64,
     .io_budget = 64,
     .worker_count = 0,

@@ -73,6 +73,10 @@ pub fn Registry(comptime ActorHeader: type) type {
             };
         }
 
+        pub fn preallocate(registry: *Self, allocator: Allocator) !void {
+            _ = try registry.ensureSlot(allocator, 0);
+        }
+
         pub fn cancelReserve(registry: *Self, sync_io: std.Io, actor_id: ActorId) void {
             registry.mutex.lockUncancelable(sync_io);
             defer registry.mutex.unlock(sync_io);
@@ -206,6 +210,28 @@ test "registry rejects stale ids after slot reuse" {
     var destroyed: usize = 0;
     registry.destroy(testing.io, &destroyed, &second);
     try testing.expectEqual(@as(usize, 1), destroyed);
+}
+
+test "registry can preallocate the first slab before reserving ids" {
+    const testing = std.testing;
+
+    const Header = struct {
+        id: ActorId,
+        destroy_fn: *const fn (*usize, *@This()) void = destroy,
+
+        fn destroy(count: *usize, _: *@This()) void {
+            count.* += 1;
+        }
+    };
+
+    var registry: Registry(Header) = .{};
+    var cleanup_count: usize = 0;
+    defer registry.deinit(testing.allocator, &cleanup_count);
+
+    try registry.preallocate(testing.allocator);
+
+    const id = try registry.reserve(testing.allocator, testing.io);
+    try testing.expectEqual(@as(usize, 0), id.index);
 }
 
 test "registry reserves unique ids across concurrent callers" {
