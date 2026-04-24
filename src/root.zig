@@ -25,6 +25,7 @@ test {
     _ = io;
     _ = Fiber;
     _ = testing;
+    _ = @import("runtime/injection_queue.zig");
     _ = @import("runtime/parker.zig");
     _ = @import("runtime/scheduler.zig");
     _ = @import("runtime/worker.zig");
