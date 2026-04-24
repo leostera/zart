@@ -72,6 +72,8 @@ const ActorHeader = struct {
     }
 };
 
+threadlocal var current_actor_header: ?*ActorHeader = null;
+
 /// Scheduler-local actor runtime.
 ///
 /// Actor handles are typed, and sending structurally copies the message value
@@ -195,10 +197,13 @@ pub const Runtime = struct {
             rt.traceActorResumed(ready.id);
             const current_worker = rt.primaryWorker();
             current_worker.setCurrent(ready);
+            current_actor_header = ready;
             const status = ready.fiber.run() catch |err| {
+                current_actor_header = null;
                 current_worker.setCurrent(null);
                 return err;
             };
+            current_actor_header = null;
             current_worker.setCurrent(null);
             switch (status) {
                 .created => unreachable,
@@ -283,7 +288,13 @@ pub const Runtime = struct {
     }
 
     fn spawnOwnerWorker(rt: *Runtime) usize {
-        return if (rt.primaryWorker().currentActor()) |current| current.owner_worker else 0;
+        return if (rt.currentActor()) |current| current.owner_worker else 0;
+    }
+
+    fn currentActor(rt: *Runtime) ?*ActorHeader {
+        const current = current_actor_header orelse return null;
+        if (current.runtime != rt) return null;
+        return current;
     }
 
     fn resolve(rt: *Runtime, comptime Msg: type, actor_id: ActorId) !*ActorHeader {
@@ -408,7 +419,7 @@ pub const Runtime = struct {
         if (rt.options.tracer) |tracer| {
             tracer.record(.{
                 .message_sent = .{
-                    .from = if (rt.primaryWorker().currentActor()) |current| current.id else null,
+                    .from = if (rt.currentActor()) |current| current.id else null,
                     .to = to,
                 },
             });
