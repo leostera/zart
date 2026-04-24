@@ -22,6 +22,7 @@ const ActorHeader = struct {
     msg_type: usize,
     state: ActorState,
     queued: bool,
+    budget_remaining: usize,
     next_run: ?*ActorHeader,
     fiber: Fiber,
     stack: []align(Fiber.stack_alignment) u8,
@@ -32,6 +33,8 @@ const ActorHeader = struct {
 pub const Runtime = struct {
     pub const Options = struct {
         stack_size: usize = 64 * 1024,
+        /// Number of explicit yield checkpoints an actor may pass per scheduler turn.
+        execution_budget: usize = 64,
         internal_allocator: ?Allocator = null,
     };
 
@@ -85,6 +88,7 @@ pub const Runtime = struct {
             if (actor.state != .runnable) continue;
 
             actor.state = .running;
+            actor.budget_remaining = rt.executionBudget();
             rt.current_actor = actor;
             const status = actor.fiber.run() catch |err| {
                 rt.current_actor = null;
@@ -196,6 +200,10 @@ pub const Runtime = struct {
         actor.queued = false;
         return actor;
     }
+
+    fn executionBudget(rt: *const Runtime) usize {
+        return @max(rt.options.execution_budget, 1);
+    }
 };
 
 pub fn Mailbox(comptime Msg: type) type {
@@ -230,6 +238,12 @@ pub fn Ctx(comptime Msg: type) type {
         }
 
         pub fn yield(ctx: *@This()) void {
+            if (ctx.actor.budget_remaining > 1) {
+                ctx.actor.budget_remaining -= 1;
+                return;
+            }
+
+            ctx.actor.budget_remaining = 0;
             ctx.actor.state = .runnable;
             ctx.runtime.enqueue(ctx.actor);
             Fiber.yield();
@@ -301,6 +315,7 @@ fn FunctionActorCell(comptime Msg: type, comptime entry: anytype) type {
                     .msg_type = typeId(Msg),
                     .state = .runnable,
                     .queued = false,
+                    .budget_remaining = 0,
                     .next_run = null,
                     .fiber = undefined,
                     .stack = stack,
@@ -357,6 +372,7 @@ fn StructActorCell(comptime Msg: type, comptime Actor: type) type {
                     .msg_type = typeId(Msg),
                     .state = .runnable,
                     .queued = false,
+                    .budget_remaining = 0,
                     .next_run = null,
                     .fiber = undefined,
                     .stack = stack,
@@ -636,7 +652,7 @@ test "yield lets another runnable actor run" {
         };
     };
 
-    var rt = Runtime.init(testing.allocator, .{});
+    var rt = Runtime.init(testing.allocator, .{ .execution_budget = 1 });
     defer rt.deinit();
 
     var trace: Trace = .{};
@@ -647,4 +663,140 @@ test "yield lets another runnable actor run" {
     try rt.run();
 
     try testing.expectEqualStrings("axbc", trace.slice());
+}
+
+test "execution budget controls yield switching" {
+    const testing = std.testing;
+
+    const Trace = struct {
+        items: [8]u8 = undefined,
+        len: usize = 0,
+
+        fn push(trace: *@This(), item: u8) void {
+            trace.items[trace.len] = item;
+            trace.len += 1;
+        }
+
+        fn slice(trace: *const @This()) []const u8 {
+            return trace.items[0..trace.len];
+        }
+    };
+
+    const OtherMsg = union(enum) {
+        hit,
+    };
+
+    const WorkerMsg = union(enum) {
+        start: Mailbox(OtherMsg),
+    };
+
+    const Actors = struct {
+        const Worker = struct {
+            pub const Msg = WorkerMsg;
+
+            trace: *Trace,
+
+            pub fn run(self: *@This(), ctx: *Ctx(Msg)) !void {
+                switch (try ctx.recv()) {
+                    .start => |other| {
+                        self.trace.push('a');
+                        try other.send(.hit);
+                        ctx.yield();
+                        self.trace.push('b');
+                        ctx.yield();
+                        self.trace.push('c');
+                    },
+                }
+            }
+        };
+
+        const Other = struct {
+            pub const Msg = OtherMsg;
+
+            trace: *Trace,
+
+            pub fn run(self: *@This(), ctx: *Ctx(Msg)) !void {
+                switch (try ctx.recv()) {
+                    .hit => self.trace.push('x'),
+                }
+            }
+        };
+    };
+
+    var rt = Runtime.init(testing.allocator, .{ .execution_budget = 2 });
+    defer rt.deinit();
+
+    var trace: Trace = .{};
+    const other = try rt.spawn(Actors.Other{ .trace = &trace });
+    const worker = try rt.spawn(Actors.Worker{ .trace = &trace });
+
+    try worker.send(.{ .start = other });
+    try rt.run();
+
+    try testing.expectEqualStrings("abxc", trace.slice());
+}
+
+test "actor can spawn child actor" {
+    const testing = std.testing;
+
+    const Reply = union(enum) {
+        value: u64,
+    };
+
+    const ChildMsg = union(enum) {
+        report: Mailbox(Reply),
+    };
+
+    const ParentMsg = union(enum) {
+        start: Mailbox(Reply),
+    };
+
+    const Actors = struct {
+        const Child = struct {
+            pub const Msg = ChildMsg;
+
+            pub fn run(_: *@This(), ctx: *Ctx(Msg)) !void {
+                switch (try ctx.recv()) {
+                    .report => |reply_to| try reply_to.send(.{ .value = 42 }),
+                }
+            }
+        };
+
+        const Parent = struct {
+            pub const Msg = ParentMsg;
+
+            pub fn run(_: *@This(), ctx: *Ctx(Msg)) !void {
+                switch (try ctx.recv()) {
+                    .start => |reply_to| {
+                        const child = try ctx.spawn(Child{});
+                        try child.send(.{ .report = reply_to });
+                    },
+                }
+            }
+        };
+
+        const Collector = struct {
+            pub const Msg = Reply;
+
+            slot: *u64,
+
+            pub fn run(self: *@This(), ctx: *Ctx(Msg)) !void {
+                switch (try ctx.recv()) {
+                    .value => |n| self.slot.* = n,
+                }
+            }
+        };
+    };
+
+    var rt = Runtime.init(testing.allocator, .{});
+    defer rt.deinit();
+
+    var observed: u64 = 0;
+    const collector = try rt.spawn(Actors.Collector{ .slot = &observed });
+    const parent = try rt.spawn(Actors.Parent{});
+
+    try parent.send(.{ .start = collector });
+    try rt.run();
+
+    try testing.expectEqual(@as(u64, 42), observed);
 }
