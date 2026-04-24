@@ -97,6 +97,8 @@ pub const Runtime = struct {
         io_budget: usize = 64,
         /// Number of scheduler workers. Only worker 0 is executed until SMP run mode lands.
         worker_count: usize = 1,
+        /// I/O implementation used only for scheduler parker futex/condition operations.
+        scheduler_io: std.Io = std.Options.debug_io,
         /// Allocator used for actor cells, fiber stacks, registry slots, and inbox nodes.
         internal_allocator: ?Allocator = null,
         /// Optional runtime event sink. `null` avoids constructing trace events.
@@ -262,7 +264,7 @@ pub const Runtime = struct {
 
         rt.actors.publish(&cell.header);
         rt.traceActorSpawned(actor_id);
-        rt.enqueue(&cell.header);
+        rt.ownerWorker(&cell.header).enqueue(&cell.header);
 
         return .{
             .raw = actor_id,
@@ -325,7 +327,15 @@ pub const Runtime = struct {
     }
 
     fn enqueue(rt: *Runtime, target: *ActorHeader) void {
-        rt.ownerWorker(target).enqueue(target);
+        const owner = rt.ownerWorker(target);
+        if (rt.currentActor()) |current| {
+            if (current.owner_worker == target.owner_worker) {
+                owner.enqueue(target);
+                return;
+            }
+        }
+
+        owner.injectAndNotify(rt.options.scheduler_io, target);
     }
 
     fn dequeue(rt: *Runtime) ?*ActorHeader {

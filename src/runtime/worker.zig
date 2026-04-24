@@ -1,5 +1,6 @@
 //! Scheduler worker state.
 
+const std = @import("std");
 const injection_queue = @import("injection_queue.zig");
 const parker = @import("parker.zig");
 const scheduler = @import("scheduler.zig");
@@ -27,9 +28,14 @@ pub fn Worker(comptime ActorHeader: type) type {
             worker.scheduler.enqueue(actor);
         }
 
-        pub fn inject(worker: *Self, actor: *ActorHeader) void {
-            if (actor.queued.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
+        pub fn inject(worker: *Self, actor: *ActorHeader) bool {
+            if (actor.queued.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return false;
             worker.injections.push(actor);
+            return true;
+        }
+
+        pub fn injectAndNotify(worker: *Self, io: std.Io, actor: *ActorHeader) void {
+            if (worker.inject(actor)) worker.parker.notify(io);
         }
 
         pub fn dequeue(worker: *Self) ?*ActorHeader {
@@ -46,14 +52,26 @@ pub fn Worker(comptime ActorHeader: type) type {
         pub fn currentActor(worker: *const Self) ?*ActorHeader {
             return worker.scheduler.current_actor;
         }
+
+        pub fn wait(worker: *Self, io: std.Io) parker.Parker.WaitResult {
+            return worker.parker.wait(io);
+        }
+
+        pub fn notify(worker: *Self, io: std.Io) void {
+            worker.parker.notify(io);
+        }
+
+        pub fn close(worker: *Self, io: std.Io) void {
+            worker.parker.close(io);
+        }
     };
 }
 
 test "worker delegates local scheduling" {
-    const testing = @import("std").testing;
+    const testing = std.testing;
 
     const Header = struct {
-        queued: @import("std").atomic.Value(bool) = .init(false),
+        queued: std.atomic.Value(bool) = .init(false),
         next_run: ?*@This() = null,
         id: usize,
     };
@@ -69,10 +87,10 @@ test "worker delegates local scheduling" {
 }
 
 test "worker consumes remote injections after local queue" {
-    const testing = @import("std").testing;
+    const testing = std.testing;
 
     const Header = struct {
-        queued: @import("std").atomic.Value(bool) = .init(false),
+        queued: std.atomic.Value(bool) = .init(false),
         next_run: ?*@This() = null,
         id: usize,
     };
@@ -81,10 +99,28 @@ test "worker consumes remote injections after local queue" {
     var local: Header = .{ .id = 1 };
     var remote: Header = .{ .id = 2 };
 
-    worker.inject(&remote);
+    try testing.expect(worker.inject(&remote));
     worker.enqueue(&local);
 
     try testing.expectEqual(@as(?*Header, &local), worker.dequeue());
     try testing.expectEqual(@as(?*Header, &remote), worker.dequeue());
     try testing.expect(!remote.queued.load(.acquire));
+}
+
+test "worker notifies parker for remote injections" {
+    const testing = std.testing;
+
+    const Header = struct {
+        queued: std.atomic.Value(bool) = .init(false),
+        next_run: ?*@This() = null,
+        id: usize,
+    };
+
+    var worker = Worker(Header).init(.{ .index = 0 });
+    var remote: Header = .{ .id = 1 };
+
+    worker.injectAndNotify(testing.io, &remote);
+
+    try testing.expectEqual(parker.Parker.WaitResult.notified, worker.wait(testing.io));
+    try testing.expectEqual(@as(?*Header, &remote), worker.dequeue());
 }
