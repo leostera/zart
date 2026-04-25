@@ -11,6 +11,16 @@
 //! provides external synchronization and fiber code does not keep thread-local
 //! references, OS-thread-affine resources, or platform TLS-derived pointers live
 //! across yield points.
+//!
+//! Limitations:
+//! - No ASan/TSan fiber annotations yet.
+//! - No Valgrind stack registration yet.
+//! - No reliable unwinding/backtraces across fiber boundaries.
+//! - No CET/shadow-stack integration on x86_64.
+//! - No C++ exception or `longjmp` crossing fiber boundaries.
+//! - No guard-page owning stack helper yet; raw stack overflow corrupts memory.
+//! - No WebAssembly backend yet. Wasm needs an Asyncify/continuation backend,
+//!   not this native stack-pointer/instruction-pointer implementation.
 
 const Fiber = @This();
 
@@ -39,13 +49,30 @@ const is_aarch64_aapcs64_basic = builtin.cpu.arch == .aarch64 and switch (native
     .linux, .macos, .freebsd, .openbsd, .netbsd => true,
     else => false,
 };
-const supported = is_x86_64_sysv or is_aarch64_aapcs64_basic;
+
+pub const Backend = enum {
+    x86_64_sysv,
+    aarch64_aapcs64_basic,
+    wasm_emscripten_asyncify,
+    unsupported,
+};
+
+pub const backend: Backend = blk: {
+    if (is_x86_64_sysv) break :blk .x86_64_sysv;
+    if (is_aarch64_aapcs64_basic) break :blk .aarch64_aapcs64_basic;
+    break :blk .unsupported;
+};
+
+pub const supported = backend != .unsupported;
 
 /// This fiber primitive does not preserve optional AArch64 SVE state.
 pub const supports_sve = false;
 /// This fiber primitive does not preserve optional AArch64 SME state.
 pub const supports_sme = false;
-pub const can_resume_on_different_thread_with_external_sync = supported;
+pub const can_resume_on_different_thread_with_external_sync = switch (backend) {
+    .x86_64_sysv, .aarch64_aapcs64_basic => true,
+    .wasm_emscripten_asyncify, .unsupported => false,
+};
 pub const supports_migration = can_resume_on_different_thread_with_external_sync;
 
 pub const Status = enum {
@@ -161,7 +188,22 @@ pub fn failure(fiber: *const Fiber) ?anyerror {
 
 pub fn deinit(fiber: *Fiber) void {
     assert(current_fiber != fiber);
-    assert(fiber.state != .running);
+    assert(fiber.state == .created or fiber.state == .completed or fiber.state == .failed);
+    fiber.debugInvalidate();
+}
+
+/// Discards a suspended fiber without unwinding its stack.
+///
+/// This is intentionally separate from `deinit` because it does not run defers,
+/// release locks, or clean up borrowed state held by the suspended call stack.
+/// Only use this when the owner can prove abandoning that stack is safe.
+pub fn abandonWithoutUnwind(fiber: *Fiber) void {
+    assert(current_fiber != fiber);
+    assert(fiber.state == .suspended);
+    fiber.debugInvalidate();
+}
+
+fn debugInvalidate(fiber: *Fiber) void {
     if (builtin.mode == .Debug) fiber.* = undefined;
 }
 
@@ -178,6 +220,14 @@ pub fn savedStackDepth(fiber: *const Fiber) usize {
 
 pub fn stackUsed(fiber: *const Fiber) usize {
     return fiber.savedStackDepth();
+}
+
+fn stackSlot(fiber: *Fiber, comptime T: type, addr: usize) *T {
+    const stack_start = @intFromPtr(fiber.stack.ptr);
+    assert(addr >= stack_start);
+    const offset = addr - stack_start;
+    assert(offset + @sizeOf(T) <= fiber.stack.len);
+    return @ptrCast(@alignCast(fiber.stack[offset..].ptr));
 }
 
 fn prepare(fiber: *Fiber) void {
@@ -206,13 +256,13 @@ fn prepare(fiber: *Fiber) void {
     const frame_addr = std.mem.alignBackward(usize, stack_end - @sizeOf(EntryFrame), stack_alignment);
     assert(frame_addr >= stack_start);
 
-    const frame: *EntryFrame = @ptrFromInt(frame_addr);
+    const frame = fiber.stackSlot(EntryFrame, frame_addr);
     frame.* = .{ .fiber = fiber };
 
     if (comptime is_aarch64_aapcs64_basic) {
         fiber.context = .{
             .sp = frame_addr,
-            .pc = @intFromPtr(&fiberEntry),
+            .pc = @intFromPtr(&fiberEntryAarch64Aapcs64Basic),
             .x19 = 0,
             .x20 = 0,
             .x21 = 0,
@@ -237,12 +287,12 @@ fn prepare(fiber: *Fiber) void {
     } else if (comptime is_x86_64_sysv) {
         const ret_slot_addr = frame_addr - @sizeOf(usize);
         assert(ret_slot_addr >= stack_start);
-        const ret_slot: *usize = @ptrFromInt(ret_slot_addr);
+        const ret_slot = fiber.stackSlot(usize, ret_slot_addr);
         ret_slot.* = 0;
 
         fiber.context = .{
             .rsp = ret_slot_addr,
-            .rip = @intFromPtr(&fiberEntry),
+            .rip = @intFromPtr(&fiberEntryX86_64SysV),
             .rbx = 0,
             .rbp = 0,
             .r12 = 0,
@@ -280,19 +330,14 @@ fn finish(fiber: *Fiber) noreturn {
     unreachable;
 }
 
-// First instruction executed on a freshly prepared fiber stack. This is naked
-// because there is no caller-created frame yet; any compiler prologue would use
-// a stack/register state that only our assembly has defined.
+// First instruction executed on a freshly prepared AArch64 fiber stack. This is
+// naked because there is no caller-created frame yet; any compiler prologue
+// would use a stack/register state that only our assembly has defined.
 //
-// The stub does exactly one ABI-specific argument move and then tail-jumps into
-// normal Zig code:
-//
-// - AArch64 AAPCS64 passes the first argument in `x0`. `sp` points directly at
-//   `EntryFrame`, so `[sp]` is the stored `Fiber *`. `x30` is cleared so an
-//   accidental return from the trampoline traps instead of jumping to garbage.
-// - x86_64 SysV passes the first argument in `rdi`. `(%rsp)` is the fake return
-//   address, so `8(%rsp)` is the stored `Fiber *`.
-fn fiberEntry() callconv(.naked) noreturn {
+// AAPCS64 passes the first argument in `x0`. `sp` points directly at
+// `EntryFrame`, so `[sp]` is the stored `Fiber *`. `x30` is cleared so an
+// accidental return from the trampoline traps instead of jumping to garbage.
+fn fiberEntryAarch64Aapcs64Basic() callconv(.naked) noreturn {
     if (comptime is_aarch64_aapcs64_basic) {
         asm volatile (
             \\ ldr x0, [sp]
@@ -301,16 +346,21 @@ fn fiberEntry() callconv(.naked) noreturn {
             :
             : [entryTrampoline] "X" (&entryTrampoline),
         );
-    } else if (comptime is_x86_64_sysv) {
+    } else unreachable;
+}
+
+// First instruction executed on a freshly prepared x86_64 SysV fiber stack.
+// `(%rsp)` is the fake return address, so `8(%rsp)` is the stored `Fiber *`.
+// SysV passes the first argument in `rdi`.
+fn fiberEntryX86_64SysV() callconv(.naked) noreturn {
+    if (comptime is_x86_64_sysv) {
         asm volatile (
             \\ movq 8(%%rsp), %%rdi
             \\ jmp %[entryTrampoline:P]
             :
             : [entryTrampoline] "X" (&entryTrampoline),
         );
-    } else {
-        unreachable;
-    }
+    } else unreachable;
 }
 
 const Context = if (supported) switch (builtin.cpu.arch) {
@@ -841,6 +891,22 @@ test "entry error after yield is observable" {
     try testing.expectEqual(Status.failed, try fiber.run());
     try testing.expectEqual(Expected.Expected, fiber.failure().?);
     try testing.expectError(error.Failed, fiber.run());
+}
+
+test "suspended fiber abandonment is explicit" {
+    if (!supported) return error.SkipZigTest;
+
+    const S = struct {
+        fn run(_: ?*anyopaque) anyerror!void {
+            yield();
+        }
+    };
+
+    var stack: [64 * 1024]u8 align(stack_alignment) = undefined;
+    var fiber = try init(&stack, S.run, null);
+
+    try std.testing.expectEqual(Status.suspended, try fiber.run());
+    fiber.abandonWithoutUnwind();
 }
 
 test "reentrant run of current fiber is rejected" {

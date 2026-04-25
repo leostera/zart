@@ -1100,7 +1100,7 @@ fn FunctionActorCell(comptime Msg: type, comptime entry: anytype) type {
         fn destroy(rt: *Runtime, header: *ActorHeader) void {
             const cell: *Self = @ptrCast(@alignCast(header));
             cell.inbox.deinit();
-            cell.header.fiber.deinit();
+            deinitActorFiber(&cell.header.fiber);
             rt.actorStackPool(&cell.header).free(cell.header.stack);
             rt.internal_allocator.destroy(cell);
         }
@@ -1163,11 +1163,18 @@ fn StructActorCell(comptime Msg: type, comptime ActorType: type) type {
         fn destroy(rt: *Runtime, header: *ActorHeader) void {
             const cell: *Self = @ptrCast(@alignCast(header));
             cell.inbox.deinit();
-            cell.header.fiber.deinit();
+            deinitActorFiber(&cell.header.fiber);
             rt.actorStackPool(&cell.header).free(cell.header.stack);
             rt.internal_allocator.destroy(cell);
         }
     };
+}
+
+fn deinitActorFiber(fiber: *Fiber) void {
+    switch (fiber.status()) {
+        .suspended => fiber.abandonWithoutUnwind(),
+        else => fiber.deinit(),
+    }
 }
 
 fn Inbox(comptime Msg: type) type {
