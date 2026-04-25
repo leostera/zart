@@ -18,9 +18,11 @@ Implemented today:
 - Configurable execution and I/O budgets.
 - Non-blocking actor I/O facade through runtime-provided `std.Io` drivers.
 - Default multicore scheduler with worker parking and work stealing.
-- POSIX file and stream socket I/O backend through `zart.io.Default`.
+- kqueue-backed file and stream socket I/O on Apple/BSD targets through `zart.io.Default`.
+- POSIX `poll(2)` I/O backend available as `zart.io.PosixPoll`.
 - Runtime tracing hooks.
 - Stack slab pooling for actor fibers.
+- Explicit ABI-preserving fiber context switching on supported native targets.
 - Runnable examples under `examples/`.
 - Runtime tests and actor/fiber benchmarks.
 
@@ -29,7 +31,10 @@ Planned:
 - Monitors and links.
 - Lock-free SMP-ready mailboxes.
 - `spawn_blocking`.
-- Poller wake fd/event integration for lower-latency cross-worker I/O submits.
+- Linux `io_uring` I/O backend.
+- Guard-page owning fiber stacks and stack high-water measurement.
+- Sanitizer/Valgrind fiber hooks.
+- WebAssembly backend via Asyncify/continuations.
 
 ## Example
 
@@ -115,7 +120,7 @@ fn worker(ctx: *zart.Ctx(CounterMsg)) !void {
 
 ```zig
 var rt = try zart.Runtime.init(allocator, .{
-    .stack_size = 16 * 1024,
+    .stack_size = 64 * 1024,
     .stack_slab_size = 4 * 1024 * 1024,
     .preallocate_stack_slab = true,
     .preallocate_registry_slab = true,
@@ -151,7 +156,37 @@ var rt = try zart.Runtime.init(allocator, .{
 });
 ```
 
-On POSIX targets, `zart.io.Default` retries non-blocking file and stream socket reads/writes internally. If an operation returns `WouldBlock`, the actor is parked until readiness is reported and then resumed with the completed result.
+Implemented POSIX-style drivers retry non-blocking file and stream socket reads/writes internally. If an operation returns `WouldBlock`, the actor is parked until readiness is reported and then resumed with the completed result.
+
+Backend status:
+
+- Apple/BSD targets: `zart.io.Default` uses `kqueue`.
+- Linux: `zart.io.Uring` is reserved for the production backend but is not implemented yet.
+- Portable POSIX fallback: `zart.io.PosixPoll` is available explicitly.
+
+Do not route blocking filesystem or network calls through `ctx.io()`. `spawn_blocking` is planned for that class of work.
+
+## Fibers
+
+Actors run on stackful fibers. `Fiber` is intentionally a low-level primitive: it owns no memory, so the caller supplies stack bytes and remains responsible for their lifetime.
+
+Supported native backends are explicit:
+
+- `x86_64_sysv`: Linux, macOS, BSD-family, DragonFly, Solaris.
+- `aarch64_aapcs64_basic`: Linux, macOS, BSD-family.
+
+The context switch saves the ABI-preserved register set directly in an `extern struct`, through global assembly with a C ABI boundary. On AArch64 the backend preserves `x19`-`x30`, `sp`, `pc`, and the low 64-bit lanes of `d8`-`d15`; optional SVE/SME state is not supported.
+
+Current Fiber limitations:
+
+- No guard-page owning stack helper yet; raw stack overflow corrupts memory.
+- No ASan/TSan fiber annotations or Valgrind stack registration yet.
+- No reliable unwinding/backtraces across fiber boundaries.
+- No CET/shadow-stack integration on x86_64.
+- No C++ exception or `longjmp` crossing fiber boundaries.
+- No WebAssembly backend yet; Wasm needs an Asyncify/continuation backend, not native stack-pointer switching.
+
+`Fiber.deinit()` rejects suspended fibers. If a runtime intentionally discards a suspended stack without unwinding, it must call `abandonWithoutUnwind()` explicitly.
 
 ## Tracing
 
