@@ -1,20 +1,25 @@
 //! kqueue-backed non-blocking actor I/O driver.
 //!
-//! Readiness events carry the runtime I/O waiter pointer in `udata`. The waiter
-//! points at the exact actor/request that must be woken when the fd becomes
-//! ready, so event dispatch does not scan all pending descriptors.
+//! Readiness events carry a stable fd/interest entry in `udata`. Each entry owns
+//! a FIFO of actor waiters, and every waiter points at the exact actor/request
+//! that must be retried when the fd becomes ready.
 
 const std = @import("std");
 const RuntimeIo = @import("../runtime/io.zig").RuntimeIo;
 const posix_io = @import("posix.zig");
 
+const Allocator = std.mem.Allocator;
 const posix = std.posix;
 
 const wake_ident: usize = 1;
 const wake_udata: usize = 1;
+const EntryMap = std.AutoHashMapUnmanaged(u64, *FdEntry);
+const IoWaiter = RuntimeIo.Request.IoWaiter;
 
 pub const Kqueue = struct {
     mutex: std.Io.Mutex = .init,
+    allocator: Allocator,
+    entries: EntryMap = .empty,
     pending_head: ?*RuntimeIo.Request = null,
     pending_tail: ?*RuntimeIo.Request = null,
     pending_count: usize = 0,
@@ -23,10 +28,17 @@ pub const Kqueue = struct {
     const Self = @This();
 
     pub fn init() !Self {
+        return initWithAllocator(std.heap.smp_allocator);
+    }
+
+    pub fn initWithAllocator(allocator: Allocator) !Self {
         const kq_fd = try createKqueue();
         errdefer posix_io.closeFd(kq_fd);
 
-        var self: Self = .{ .kq_fd = kq_fd };
+        var self: Self = .{
+            .allocator = allocator,
+            .kq_fd = kq_fd,
+        };
         try self.registerWakeEvent();
         return self;
     }
@@ -35,6 +47,9 @@ pub const Kqueue = struct {
         if (self.pending_count != 0 or self.pending_head != null or self.pending_tail != null) {
             @panic("kqueue I/O driver deinit called with pending requests");
         }
+        var values = self.entries.valueIterator();
+        while (values.next()) |entry_ptr| self.allocator.destroy(entry_ptr.*);
+        self.entries.deinit(self.allocator);
         posix_io.closeFd(self.kq_fd);
         self.* = undefined;
     }
@@ -55,15 +70,22 @@ pub const Kqueue = struct {
 
         self.mutex.lockUncancelable(std.Options.debug_io);
         if (std.debug.runtime_safety) self.assertNotPending(request);
-        self.enqueue(request);
-        self.mutex.unlock(std.Options.debug_io);
-
-        self.armRequest(request) catch {
-            self.mutex.lockUncancelable(std.Options.debug_io);
-            _ = self.remove(request);
+        const entry = self.ensureEntryLocked(posix_io.fdOf(request), posix_io.interestOf(request)) catch {
             self.mutex.unlock(std.Options.debug_io);
-            @panic("failed to register kqueue actor I/O request");
+            @panic("failed to allocate kqueue actor I/O waiter");
         };
+        self.enqueue(request);
+        entry.append(request);
+        if (!entry.registered) {
+            self.registerEntry(entry) catch {
+                _ = entry.remove(request);
+                _ = self.remove(request);
+                self.mutex.unlock(std.Options.debug_io);
+                @panic("failed to register kqueue actor I/O request");
+            };
+            entry.registered = true;
+        }
+        self.mutex.unlock(std.Options.debug_io);
     }
 
     fn poll(context: ?*anyopaque, mode: RuntimeIo.PollMode) !void {
@@ -83,8 +105,8 @@ pub const Kqueue = struct {
             var completed_any = false;
             for (events_buffer[0..ready]) |event| {
                 if (event.udata == wake_udata) continue;
-                const waiter: *RuntimeIo.Request.IoWaiter = @ptrFromInt(event.udata);
-                completed_any = self.retryReady(waiter) or completed_any;
+                const entry: *FdEntry = @ptrFromInt(event.udata);
+                completed_any = self.retryReady(entry) or completed_any;
             }
 
             if (mode == .nonblocking or completed_any or self.isEmpty()) return;
@@ -104,6 +126,13 @@ pub const Kqueue = struct {
             self.pending_head = request;
         }
         self.pending_tail = request;
+        self.pending_count += 1;
+    }
+
+    fn prepend(self: *Self, request: *RuntimeIo.Request) void {
+        request.next = self.pending_head;
+        self.pending_head = request;
+        if (self.pending_tail == null) self.pending_tail = request;
         self.pending_count += 1;
     }
 
@@ -130,29 +159,69 @@ pub const Kqueue = struct {
         return false;
     }
 
-    fn retryReady(self: *Self, waiter: *RuntimeIo.Request.IoWaiter) bool {
-        const request = waiter.request orelse return false;
-        if (waiter.actor != request.actor) return false;
-        if (posix_io.tryComplete(request)) {
-            self.mutex.lockUncancelable(std.Options.debug_io);
-            const removed = self.remove(request);
-            self.mutex.unlock(std.Options.debug_io);
-            if (!removed and std.debug.runtime_safety) @panic("kqueue completed request that was not pending");
-            return true;
-        }
+    fn retryReady(self: *Self, entry: *FdEntry) bool {
+        var completed_any = false;
 
-        self.armRequest(request) catch {
+        while (true) {
             self.mutex.lockUncancelable(std.Options.debug_io);
-            _ = self.remove(request);
+            const request = entry.firstRequest() orelse {
+                self.mutex.unlock(std.Options.debug_io);
+                return completed_any;
+            };
+            const waiter_removed_before_retry = entry.remove(request);
+            const pending_removed_before_retry = self.remove(request);
             self.mutex.unlock(std.Options.debug_io);
-            @panic("failed to rearm kqueue actor I/O request");
-        };
-        return false;
+
+            if (!posix_io.tryComplete(request)) {
+                self.mutex.lockUncancelable(std.Options.debug_io);
+                self.prepend(request);
+                entry.prepend(request);
+                self.mutex.unlock(std.Options.debug_io);
+                if (std.debug.runtime_safety and (!waiter_removed_before_retry or !pending_removed_before_retry)) {
+                    @panic("kqueue retried request that was not pending");
+                }
+                return completed_any;
+            }
+
+            self.mutex.lockUncancelable(std.Options.debug_io);
+            if (entry.isEmpty() and entry.registered) {
+                self.deregisterEntry(entry) catch {};
+                entry.registered = false;
+            }
+            self.mutex.unlock(std.Options.debug_io);
+
+            if (std.debug.runtime_safety and (!pending_removed_before_retry or !waiter_removed_before_retry)) {
+                @panic("kqueue completed request that was not pending");
+            }
+            completed_any = true;
+        }
     }
 
-    fn armRequest(self: *Self, request: *RuntimeIo.Request) !void {
-        var change = requestEvent(request);
+    fn ensureEntryLocked(self: *Self, fd: posix.fd_t, interest: posix_io.Interest) !*FdEntry {
+        const key = entryKey(fd, interest);
+        if (self.entries.get(key)) |entry| return entry;
+
+        const entry = try self.allocator.create(FdEntry);
+        errdefer self.allocator.destroy(entry);
+        entry.* = .{
+            .fd = fd,
+            .interest = interest,
+        };
+        try self.entries.put(self.allocator, key, entry);
+        return entry;
+    }
+
+    fn registerEntry(self: *Self, entry: *FdEntry) !void {
+        var change = entryEvent(entry, std.c.EV.ADD | std.c.EV.CLEAR);
         _ = try kevent(self.kq_fd, (&change)[0..1], &.{}, null);
+    }
+
+    fn deregisterEntry(self: *Self, entry: *FdEntry) !void {
+        var change = entryEvent(entry, std.c.EV.DELETE);
+        _ = kevent(self.kq_fd, (&change)[0..1], &.{}, null) catch |err| switch (err) {
+            error.EventNotFound => return,
+            else => |e| return e,
+        };
     }
 
     fn registerWakeEvent(self: *Self) !void {
@@ -206,20 +275,86 @@ pub const Kqueue = struct {
     }
 };
 
-fn requestEvent(request: *RuntimeIo.Request) posix.Kevent {
-    var flags: u32 = std.c.EV.ADD | std.c.EV.ONESHOT;
-    if (comptime @hasDecl(std.c.EV, "UDATA_SPECIFIC")) {
-        flags |= std.c.EV.UDATA_SPECIFIC;
+const FdEntry = struct {
+    fd: posix.fd_t,
+    interest: posix_io.Interest,
+    registered: bool = false,
+    waiter_head: ?*IoWaiter = null,
+    waiter_tail: ?*IoWaiter = null,
+
+    fn append(entry: *FdEntry, request: *RuntimeIo.Request) void {
+        const waiter = &request.io_waiter;
+        waiter.reset(request);
+        waiter.next = null;
+        if (entry.waiter_tail) |tail| {
+            tail.next = waiter;
+        } else {
+            entry.waiter_head = waiter;
+        }
+        entry.waiter_tail = waiter;
     }
 
+    fn prepend(entry: *FdEntry, request: *RuntimeIo.Request) void {
+        const waiter = &request.io_waiter;
+        waiter.reset(request);
+        waiter.next = entry.waiter_head;
+        entry.waiter_head = waiter;
+        if (entry.waiter_tail == null) entry.waiter_tail = waiter;
+    }
+
+    fn remove(entry: *FdEntry, request: *RuntimeIo.Request) bool {
+        var previous: ?*IoWaiter = null;
+        var current = entry.waiter_head;
+        while (current) |waiter| {
+            const next = waiter.next;
+            if (waiter.request == request) {
+                if (previous) |prev| {
+                    prev.next = next;
+                } else {
+                    entry.waiter_head = next;
+                }
+                if (entry.waiter_tail == waiter) entry.waiter_tail = previous;
+                waiter.next = null;
+                waiter.request = null;
+                waiter.actor = null;
+                return true;
+            }
+            previous = waiter;
+            current = next;
+        }
+        return false;
+    }
+
+    fn firstRequest(entry: *const FdEntry) ?*RuntimeIo.Request {
+        const waiter = entry.waiter_head orelse return null;
+        const request = waiter.request orelse return null;
+        if (waiter.actor != request.actor) return null;
+        return request;
+    }
+
+    fn isEmpty(entry: *const FdEntry) bool {
+        return entry.waiter_head == null;
+    }
+};
+
+fn entryEvent(entry: *FdEntry, flags: u32) posix.Kevent {
     return .{
-        .ident = @intCast(posix_io.fdOf(request)),
-        .filter = filterOf(posix_io.interestOf(request)),
+        .ident = @intCast(entry.fd),
+        .filter = filterOf(entry.interest),
         .flags = @intCast(flags),
         .fflags = 0,
         .data = 0,
-        .udata = @intFromPtr(&request.io_waiter),
+        .udata = @intFromPtr(entry),
     };
+}
+
+fn entryKey(fd: posix.fd_t, interest: posix_io.Interest) u64 {
+    const fd_part: u64 = @intCast(fd);
+    const interest_part: u64 = switch (interest) {
+        .read => 0,
+        .write => 1,
+    };
+    return (fd_part << 1) | interest_part;
 }
 
 fn filterOf(interest: posix_io.Interest) @TypeOf(@as(posix.Kevent, undefined).filter) {
