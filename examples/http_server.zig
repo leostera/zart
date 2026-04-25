@@ -26,9 +26,12 @@ const Connection = struct {
     fn serve(self: *@This(), ctx: *zart.Ctx(Msg)) !void {
         defer self.stream.close(std.Options.debug_io);
 
+        const started_at = std.Io.Timestamp.now(std.Options.debug_io, .real);
+        const started = std.Io.Timestamp.now(std.Options.debug_io, .awake);
+
         var request_storage: [4096]u8 = undefined;
         const request = try readHttpRequest(self.stream, ctx.io(), &request_storage);
-        const first_line = firstRequestLine(request);
+        const request_line = parseRequestLine(request);
 
         var body_storage: [512]u8 = undefined;
         const body = try std.fmt.bufPrint(&body_storage,
@@ -36,7 +39,7 @@ const Connection = struct {
             \\connection actor: {d}
             \\request: {s}
             \\
-        , .{ self.request_index, first_line });
+        , .{ self.request_index, request_line.raw });
 
         var writer_storage: [1024]u8 = undefined;
         var writer = self.stream.writer(ctx.io(), &writer_storage);
@@ -50,6 +53,9 @@ const Connection = struct {
         );
         try writer.interface.writeAll(body);
         try writer.interface.flush();
+
+        const finished = std.Io.Timestamp.now(std.Options.debug_io, .awake);
+        logRequest(started_at, request_line, started.durationTo(finished));
     }
 };
 
@@ -150,9 +156,78 @@ fn readHttpRequest(stream: std.Io.net.Stream, io: std.Io, storage: []u8) ![]cons
     return storage[0..used];
 }
 
-fn firstRequestLine(request: []const u8) []const u8 {
+const RequestLine = struct {
+    raw: []const u8,
+    method: []const u8,
+    path: []const u8,
+};
+
+fn parseRequestLine(request: []const u8) RequestLine {
     const end = std.mem.indexOf(u8, request, "\r\n") orelse request.len;
-    return request[0..end];
+    const raw = request[0..end];
+
+    var fields = std.mem.tokenizeScalar(u8, raw, ' ');
+    return .{
+        .raw = raw,
+        .method = fields.next() orelse "-",
+        .path = fields.next() orelse "-",
+    };
+}
+
+fn logRequest(started_at: std.Io.Timestamp, request_line: RequestLine, elapsed: std.Io.Duration) void {
+    var timestamp_buffer: [32]u8 = undefined;
+    const timestamp = formatTimestamp(&timestamp_buffer, started_at) catch "unknown-time";
+
+    var duration_buffer: [32]u8 = undefined;
+    const duration = formatDuration(&duration_buffer, elapsed) catch "unknown-duration";
+
+    std.debug.print("{s} {s} {s:<32} {s}\n", .{
+        timestamp,
+        request_line.method,
+        request_line.path,
+        duration,
+    });
+}
+
+fn formatTimestamp(buffer: []u8, timestamp: std.Io.Timestamp) ![]const u8 {
+    const nanoseconds = timestamp.toNanoseconds();
+    if (nanoseconds < 0) return std.fmt.bufPrint(buffer, "{d}ns", .{nanoseconds});
+
+    const total_seconds: u64 = @intCast(@divTrunc(nanoseconds, std.time.ns_per_s));
+    const millisecond: u16 = @intCast(@divTrunc(@mod(nanoseconds, std.time.ns_per_s), std.time.ns_per_ms));
+
+    const epoch_seconds: std.time.epoch.EpochSeconds = .{ .secs = total_seconds };
+    const year_day = epoch_seconds.getEpochDay().calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const day_seconds = epoch_seconds.getDaySeconds();
+
+    return std.fmt.bufPrint(buffer, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}Z", .{
+        year_day.year,
+        month_day.month.numeric(),
+        month_day.day_index + 1,
+        day_seconds.getHoursIntoDay(),
+        day_seconds.getMinutesIntoHour(),
+        day_seconds.getSecondsIntoMinute(),
+        millisecond,
+    });
+}
+
+fn formatDuration(buffer: []u8, duration: std.Io.Duration) ![]const u8 {
+    const ns = duration.toNanoseconds();
+    const abs_ns = @abs(ns);
+    if (abs_ns < std.time.ns_per_us) {
+        return std.fmt.bufPrint(buffer, "{d}ns", .{ns});
+    }
+
+    const ns_float: f64 = @floatFromInt(ns);
+    if (abs_ns < std.time.ns_per_ms) {
+        return std.fmt.bufPrint(buffer, "{d:.2}us", .{ns_float / std.time.ns_per_us});
+    }
+    if (abs_ns < std.time.ns_per_s) {
+        return std.fmt.bufPrint(buffer, "{d:.2}ms", .{ns_float / std.time.ns_per_ms});
+    }
+
+    return std.fmt.bufPrint(buffer, "{d:.2}s", .{ns_float / std.time.ns_per_s});
 }
 
 fn setNonblocking(fd: std.Io.net.Socket.Handle) !void {
