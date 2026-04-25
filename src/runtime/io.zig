@@ -41,11 +41,25 @@ pub const RuntimeIo = struct {
     pub const Request = struct {
         next: ?*Request = null,
         completion_next: ?*Request = null,
+        io_waiter: IoWaiter = .{},
         actor: *anyopaque,
         complete_context: ?*anyopaque = null,
         complete_fn: ?*const fn (?*anyopaque, *Request) void = null,
         completed: std.atomic.Value(bool) = .init(false),
         payload: Payload,
+
+        pub const IoWaiter = struct {
+            next: ?*IoWaiter = null,
+            actor: ?*anyopaque = null,
+            request: ?*Request = null,
+
+            pub fn reset(waiter: *IoWaiter, request: *Request) void {
+                waiter.* = .{
+                    .actor = request.actor,
+                    .request = request,
+                };
+            }
+        };
 
         pub const Payload = union(enum) {
             operate: Operate,
@@ -425,6 +439,7 @@ pub const RuntimeIo = struct {
     ) void {
         request.next = null;
         request.completion_next = null;
+        request.io_waiter.reset(request);
         request.complete_context = complete_context;
         request.complete_fn = complete_fn;
         request.completed.store(false, .monotonic);
@@ -532,6 +547,42 @@ test "runtime io completion queue accepts concurrent producers" {
     try testing.expectEqual(@as(usize, Total), count);
     try testing.expect(!runtime_io.hasPending());
     for (seen) |item_seen| try testing.expect(item_seen);
+}
+
+test "runtime io prepares actor-targeted waiter metadata" {
+    const testing = std.testing;
+
+    const Driver = struct {
+        seen_actor: ?*anyopaque = null,
+        seen_request: ?*RuntimeIo.Request = null,
+
+        fn driver(self: *@This()) RuntimeIo.Driver {
+            return .{
+                .context = self,
+                .submit_fn = submit,
+            };
+        }
+
+        fn submit(context: ?*anyopaque, request: *RuntimeIo.Request) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.seen_actor = request.io_waiter.actor;
+            self.seen_request = request.io_waiter.request;
+            request.completeSleep({});
+        }
+    };
+
+    var driver_state: Driver = .{};
+    var runtime_io = try RuntimeIo.init(testing.allocator, driver_state.driver());
+    defer runtime_io.deinit(testing.allocator);
+
+    var actor: u8 = 0;
+    var request = RuntimeIo.Request.initSleep(&actor, .none);
+    runtime_io.submit(&request);
+
+    try testing.expectEqual(@intFromPtr(&actor), @intFromPtr(driver_state.seen_actor.?));
+    try testing.expectEqual(&request, driver_state.seen_request.?);
+    try testing.expect(runtime_io.popCompletion(testing.io) == &request);
+    try testing.expect(!runtime_io.hasPending());
 }
 
 pub const ActorIoContext = struct {

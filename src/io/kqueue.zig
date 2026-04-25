@@ -1,8 +1,8 @@
 //! kqueue-backed non-blocking actor I/O driver.
 //!
-//! Readiness events carry the `RuntimeIo.Request` pointer in `udata`, so the
-//! backend can complete the actor request directly without scanning all pending
-//! descriptors.
+//! Readiness events carry the runtime I/O waiter pointer in `udata`. The waiter
+//! points at the exact actor/request that must be woken when the fd becomes
+//! ready, so event dispatch does not scan all pending descriptors.
 
 const std = @import("std");
 const RuntimeIo = @import("../runtime/io.zig").RuntimeIo;
@@ -50,6 +50,7 @@ pub const Kqueue = struct {
 
     fn submit(context: ?*anyopaque, request: *RuntimeIo.Request) void {
         const self: *Self = @ptrCast(@alignCast(context.?));
+        request.io_waiter.reset(request);
         if (posix_io.tryComplete(request)) return;
 
         self.mutex.lockUncancelable(std.Options.debug_io);
@@ -82,8 +83,8 @@ pub const Kqueue = struct {
             var completed_any = false;
             for (events_buffer[0..ready]) |event| {
                 if (event.udata == wake_udata) continue;
-                const request: *RuntimeIo.Request = @ptrFromInt(event.udata);
-                completed_any = self.retryReady(request) or completed_any;
+                const waiter: *RuntimeIo.Request.IoWaiter = @ptrFromInt(event.udata);
+                completed_any = self.retryReady(waiter) or completed_any;
             }
 
             if (mode == .nonblocking or completed_any or self.isEmpty()) return;
@@ -129,7 +130,9 @@ pub const Kqueue = struct {
         return false;
     }
 
-    fn retryReady(self: *Self, request: *RuntimeIo.Request) bool {
+    fn retryReady(self: *Self, waiter: *RuntimeIo.Request.IoWaiter) bool {
+        const request = waiter.request orelse return false;
+        if (waiter.actor != request.actor) return false;
         if (posix_io.tryComplete(request)) {
             self.mutex.lockUncancelable(std.Options.debug_io);
             const removed = self.remove(request);
@@ -215,7 +218,7 @@ fn requestEvent(request: *RuntimeIo.Request) posix.Kevent {
         .flags = @intCast(flags),
         .fflags = 0,
         .data = 0,
-        .udata = @intFromPtr(request),
+        .udata = @intFromPtr(&request.io_waiter),
     };
 }
 
