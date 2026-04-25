@@ -103,6 +103,8 @@ pub const RunError = error{
 
 pub const Entry = *const fn (arg: ?*anyopaque) anyerror!void;
 
+const stack_high_water_byte: u8 = 0xa5;
+
 /// Owning POSIX stack allocation with one inaccessible guard page below the
 /// usable stack. This helper is safer than a raw byte slice for standalone
 /// fibers because downward stack overflow traps instead of corrupting adjacent
@@ -148,6 +150,20 @@ pub const Stack = struct {
         std.posix.munmap(stack.mapping);
         if (builtin.mode == .Debug) stack.* = undefined;
     }
+
+    /// Initializes a fiber on this stack and enables high-water measurement.
+    /// The fill pass is intentionally opt-in because it touches every stack
+    /// byte and would be too expensive for hot actor-spawn paths.
+    pub fn initFiber(
+        stack: *Stack,
+        fiber: *Fiber,
+        entry: Entry,
+        arg: ?*anyopaque,
+    ) InitError!void {
+        @memset(stack.usable, stack_high_water_byte);
+        try Fiber.init(fiber, stack.usable, entry, arg);
+        fiber.track_stack_high_water = true;
+    }
 };
 
 const X86FpControl = extern struct {
@@ -166,6 +182,7 @@ failure_error: ?anyerror,
 resumer_context: ?*Context,
 resumer_fiber: ?*Fiber,
 prepared: bool,
+track_stack_high_water: bool,
 
 threadlocal var current_fiber: ?*Fiber = null;
 
@@ -190,6 +207,7 @@ pub fn init(
         .resumer_context = null,
         .resumer_fiber = null,
         .prepared = false,
+        .track_stack_high_water = false,
     };
 }
 
@@ -293,20 +311,40 @@ pub fn savedStackDepth(fiber: *const Fiber) usize {
     if (!fiber.prepared) return 0;
     const saved_sp = fiber.context.stackPointer();
     const stack_start = @intFromPtr(fiber.stack.ptr);
-    const stack_end = stack_start + fiber.stack.len;
+    const stack_end = fiber.stackEnd() orelse return 0;
     if (saved_sp < stack_start or saved_sp > stack_end) return 0;
     return stack_end - saved_sp;
+}
+
+/// Returns the observed maximum stack depth for fibers initialized with
+/// `Stack.initFiber`. Raw stacks are not filled with the sentinel pattern, so
+/// this returns zero for normal `init` fibers.
+pub fn stackHighWaterMark(fiber: *const Fiber) usize {
+    fiber.checkPinned();
+    if (!fiber.track_stack_high_water) return 0;
+
+    var first_used: usize = 0;
+    while (first_used < fiber.stack.len and fiber.stack[first_used] == stack_high_water_byte) {
+        first_used += 1;
+    }
+
+    return fiber.stack.len - first_used;
 }
 
 pub fn stackUsed(fiber: *const Fiber) usize {
     return fiber.savedStackDepth();
 }
 
+fn stackEnd(fiber: *const Fiber) ?usize {
+    return std.math.add(usize, @intFromPtr(fiber.stack.ptr), fiber.stack.len) catch null;
+}
+
 fn stackSlot(fiber: *Fiber, comptime T: type, addr: usize) *T {
     const stack_start = @intFromPtr(fiber.stack.ptr);
     assert(addr >= stack_start);
     const offset = addr - stack_start;
-    assert(offset + @sizeOf(T) <= fiber.stack.len);
+    assert(offset <= fiber.stack.len);
+    assert(@sizeOf(T) <= fiber.stack.len - offset);
     return @ptrCast(@alignCast(fiber.stack[offset..].ptr));
 }
 
@@ -315,7 +353,7 @@ fn prepare(fiber: *Fiber) void {
     assert(fiber.state == .created);
 
     const stack_start = @intFromPtr(fiber.stack.ptr);
-    const stack_end = stack_start + fiber.stack.len;
+    const stack_end = fiber.stackEnd() orelse @panic("fiber stack address range overflow");
 
     // Fiber stacks grow downward on both currently supported ABIs. The initial
     // stack contains only an `EntryFrame`, which gives the naked entry stub the
@@ -1159,12 +1197,14 @@ test "owning stack provides guarded usable memory" {
     try testing.expectEqual(@as(usize, 0), @intFromPtr(owned_stack.usable.ptr) % stack_alignment);
 
     var fiber: Fiber = undefined;
-    try init(&fiber, owned_stack.usable, struct {
+    try owned_stack.initFiber(&fiber, struct {
         fn run(_: ?*anyopaque) anyerror!void {}
     }.run, null);
     defer fiber.deinit();
 
+    try testing.expectEqual(@as(usize, 0), fiber.stackHighWaterMark());
     try testing.expectEqual(Status.completed, try fiber.run());
+    try testing.expect(fiber.stackHighWaterMark() > 0);
 }
 
 test "fiber records its pinned address" {
