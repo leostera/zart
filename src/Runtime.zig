@@ -644,7 +644,14 @@ pub const Runtime = struct {
                         return .deferred;
                     }
                 },
-                .runnable, .running, .completed, .failed => return .none,
+                .running => {
+                    if (target.loadWaitReason() != reason) return .none;
+                    if (target.transitionState(.running, .runnable)) {
+                        target.storeWaitReason(.none);
+                        return .deferred;
+                    }
+                },
+                .runnable, .completed, .failed => return .none,
             }
         }
     }
@@ -920,19 +927,36 @@ fn chargeActorIo(runtime: *anyopaque, actor_header: *anyopaque) void {
     rt.chargeIoBoundary(target);
 }
 
+fn prepareActorIoPark(runtime: *anyopaque, actor_header: *anyopaque) void {
+    const rt: *Runtime = @ptrCast(@alignCast(runtime));
+    const target: *ActorHeader = @ptrCast(@alignCast(actor_header));
+    if (target.loadWaitReason() != .io) rt.traceActorIoSubmitted(target.id);
+    rt.traceActorWaiting(target.id);
+    target.storeWaitReason(.io);
+}
+
+fn cancelActorIoPark(_: *anyopaque, actor_header: *anyopaque) void {
+    const target: *ActorHeader = @ptrCast(@alignCast(actor_header));
+    if (target.loadWaitReason() == .io) target.storeWaitReason(.none);
+}
+
 fn notifyIoCompletion(context: ?*anyopaque, request: *RuntimeIo.Request) void {
     const rt: *Runtime = @ptrCast(@alignCast(context.?));
     const target: *ActorHeader = @ptrCast(@alignCast(request.actor));
     rt.ownerWorker(target).notify(rt.options.scheduler_io);
 }
 
-fn parkActorIo(runtime: *anyopaque, actor_header: *anyopaque) void {
-    const rt: *Runtime = @ptrCast(@alignCast(runtime));
+fn parkActorIo(_: *anyopaque, actor_header: *anyopaque) void {
     const target: *ActorHeader = @ptrCast(@alignCast(actor_header));
-    if (target.loadWaitReason() != .io) rt.traceActorIoSubmitted(target.id);
-    rt.traceActorWaiting(target.id);
-    target.storeWaitReason(.io);
-    target.mustTransitionState(.running, .parking);
+    while (true) {
+        switch (target.loadState()) {
+            .running => {
+                if (target.transitionState(.running, .parking)) break;
+            },
+            .runnable, .parking, .waiting => break,
+            .completed, .failed => return,
+        }
+    }
     Fiber.yield();
 }
 
@@ -962,7 +986,16 @@ pub fn Ctx(comptime Msg: type) type {
 
                 ctx.runtime.traceActorWaiting(ctx.actor.id);
                 ctx.actor.storeWaitReason(.recv);
-                ctx.actor.mustTransitionState(.running, .parking);
+                while (true) {
+                    switch (ctx.actor.loadState()) {
+                        .running => {
+                            if (ctx.actor.transitionState(.running, .parking)) break;
+                        },
+                        .runnable => break,
+                        .parking, .waiting => break,
+                        .completed, .failed => return error.ActorDead,
+                    }
+                }
                 if (ctx.inbox.hasMessages() and ctx.actor.transitionState(.parking, .running)) {
                     ctx.actor.storeWaitReason(.none);
                     continue;
@@ -1053,7 +1086,7 @@ fn FunctionActorCell(comptime Msg: type, comptime entry: anytype) type {
                     .raw = cell.header.id,
                     .runtime = cell.header.runtime,
                 },
-                .io_context = .init(&cell.header.runtime.io, cell.header.runtime, &cell.header, chargeActorIo, parkActorIo),
+                .io_context = .init(&cell.header.runtime.io, cell.header.runtime, &cell.header, chargeActorIo, prepareActorIoPark, cancelActorIoPark, parkActorIo),
             };
             try entry(&ctx);
         }
@@ -1116,7 +1149,7 @@ fn StructActorCell(comptime Msg: type, comptime ActorType: type) type {
                     .raw = cell.header.id,
                     .runtime = cell.header.runtime,
                 },
-                .io_context = .init(&cell.header.runtime.io, cell.header.runtime, &cell.header, chargeActorIo, parkActorIo),
+                .io_context = .init(&cell.header.runtime.io, cell.header.runtime, &cell.header, chargeActorIo, prepareActorIoPark, cancelActorIoPark, parkActorIo),
             };
             try cell.actor.run(&ctx);
         }

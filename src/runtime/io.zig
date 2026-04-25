@@ -539,6 +539,8 @@ pub const ActorIoContext = struct {
     charge_runtime: *anyopaque,
     charge_actor: *anyopaque,
     charge_fn: *const fn (*anyopaque, *anyopaque) void,
+    prepare_park_fn: *const fn (*anyopaque, *anyopaque) void,
+    cancel_park_fn: *const fn (*anyopaque, *anyopaque) void,
     park_fn: *const fn (*anyopaque, *anyopaque) void,
 
     pub fn init(
@@ -546,6 +548,8 @@ pub const ActorIoContext = struct {
         charge_runtime: *anyopaque,
         charge_actor: *anyopaque,
         charge_fn: *const fn (*anyopaque, *anyopaque) void,
+        prepare_park_fn: *const fn (*anyopaque, *anyopaque) void,
+        cancel_park_fn: *const fn (*anyopaque, *anyopaque) void,
         park_fn: *const fn (*anyopaque, *anyopaque) void,
     ) ActorIoContext {
         return .{
@@ -553,6 +557,8 @@ pub const ActorIoContext = struct {
             .charge_runtime = charge_runtime,
             .charge_actor = charge_actor,
             .charge_fn = charge_fn,
+            .prepare_park_fn = prepare_park_fn,
+            .cancel_park_fn = cancel_park_fn,
             .park_fn = park_fn,
         };
     }
@@ -568,13 +574,25 @@ pub const ActorIoContext = struct {
         context.charge_fn(context.charge_runtime, context.charge_actor);
     }
 
+    fn preparePark(context: *ActorIoContext) void {
+        context.prepare_park_fn(context.charge_runtime, context.charge_actor);
+    }
+
+    fn cancelPark(context: *ActorIoContext) void {
+        context.cancel_park_fn(context.charge_runtime, context.charge_actor);
+    }
+
     fn park(context: *ActorIoContext) void {
         context.park_fn(context.charge_runtime, context.charge_actor);
     }
 
     fn wait(context: *ActorIoContext, request: *RuntimeIo.Request) void {
         var completion: RuntimeIo.ActorCompletion = undefined;
-        if (context.runtime_io.submitActor(request, &completion)) return;
+        context.preparePark();
+        if (context.runtime_io.submitActor(request, &completion)) {
+            context.cancelPark();
+            return;
+        }
 
         // Always park once so the scheduler drains the completion before the
         // actor can return and unwind this stack-backed request.
