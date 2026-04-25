@@ -97,6 +97,12 @@ pub const RunError = error{
 
 pub const Entry = *const fn (arg: ?*anyopaque) anyerror!void;
 
+const X86FpControl = extern struct {
+    mxcsr: u32 = 0x1f80,
+    x87_cw: u16 = 0x037f,
+    _pad: u16 = 0,
+};
+
 context: Context = undefined,
 stack: []align(stack_alignment) u8,
 entry: Entry,
@@ -290,6 +296,7 @@ fn prepare(fiber: *Fiber) void {
         const ret_slot = fiber.stackSlot(usize, ret_slot_addr);
         ret_slot.* = 0;
 
+        const fp_control = captureX86FpControl();
         fiber.context = .{
             .rsp = ret_slot_addr,
             .rip = @intFromPtr(&fiberEntryX86_64SysV),
@@ -299,6 +306,9 @@ fn prepare(fiber: *Fiber) void {
             .r13 = 0,
             .r14 = 0,
             .r15 = 0,
+            .mxcsr = fp_control.mxcsr,
+            .x87_cw = fp_control.x87_cw,
+            ._pad = 0,
         };
     } else unreachable;
 
@@ -402,10 +412,13 @@ const Context = if (supported) switch (builtin.cpu.arch) {
     },
     .x86_64 => extern struct {
         // Offsets are part of the hand-written assembly contract:
-        //   0: rsp, 8: rip, 16: rbx, 24: rbp, 32..56: r12..r15.
+        //   0: rsp, 8: rip, 16: rbx, 24: rbp, 32..56: r12..r15,
+        //   64: MXCSR, 68: x87 control word.
         //
-        // Under the SysV ABI these GPRs are callee-saved. Vector/MMX/XMM state
-        // is caller-saved under SysV, so it is not stored in the fiber context.
+        // Under the SysV ABI these GPRs are callee-saved. MXCSR status bits
+        // are caller-saved, but MXCSR control bits and the x87 control word are
+        // callee-saved. `stmxcsr`/`ldmxcsr` save and restore the whole MXCSR
+        // word because the instruction does not expose a control-bit-only form.
         rsp: usize,
         rip: usize,
         rbx: usize,
@@ -414,6 +427,9 @@ const Context = if (supported) switch (builtin.cpu.arch) {
         r13: usize,
         r14: usize,
         r15: usize,
+        mxcsr: u32,
+        x87_cw: u16,
+        _pad: u16,
 
         fn stackPointer(context: @This()) usize {
             return context.rsp;
@@ -460,9 +476,14 @@ fn verifyContextLayout() void {
         expectOffset(Context, "r13", 40);
         expectOffset(Context, "r14", 48);
         expectOffset(Context, "r15", 56);
-        expectSize(Context, 64);
+        expectOffset(Context, "mxcsr", 64);
+        expectOffset(Context, "x87_cw", 68);
+        expectOffset(Context, "_pad", 70);
+        expectSize(Context, 72);
     }
 }
+
+extern fn zart_fiber_capture_x86_fp_control(out: *X86FpControl) callconv(.c) void;
 
 extern fn zart_fiber_switch(prev: *Context, next: *const Context) callconv(.c) void;
 
@@ -545,17 +566,46 @@ comptime {
                     "    movq %r13, 40(%rdi)\n" ++
                     "    movq %r14, 48(%rdi)\n" ++
                     "    movq %r15, 56(%rdi)\n" ++
+                    "    stmxcsr 64(%rdi)\n" ++
+                    "    fnstcw 68(%rdi)\n" ++
                     "    movq 16(%rsi), %rbx\n" ++
                     "    movq 24(%rsi), %rbp\n" ++
                     "    movq 32(%rsi), %r12\n" ++
                     "    movq 40(%rsi), %r13\n" ++
                     "    movq 48(%rsi), %r14\n" ++
                     "    movq 56(%rsi), %r15\n" ++
+                    "    ldmxcsr 64(%rsi)\n" ++
+                    "    fldcw 68(%rsi)\n" ++
                     "    movq 0(%rsi), %rsp\n" ++
                     "    jmpq *8(%rsi)\n" ++
                     "1:\n" ++
                     "    retq\n");
         }
+    }
+}
+
+comptime {
+    if (is_x86_64_sysv) {
+        const prefix = if (builtin.object_format == .macho) "_" else "";
+        const symbol = prefix ++ "zart_fiber_capture_x86_fp_control";
+
+        asm (".text\n" ++
+                ".globl " ++ symbol ++ "\n" ++
+                symbol ++ ":\n" ++
+                "    stmxcsr 0(%rdi)\n" ++
+                "    fnstcw 4(%rdi)\n" ++
+                "    movw $0, 6(%rdi)\n" ++
+                "    retq\n");
+    }
+}
+
+fn captureX86FpControl() X86FpControl {
+    if (comptime is_x86_64_sysv) {
+        var control: X86FpControl = .{};
+        zart_fiber_capture_x86_fp_control(&control);
+        return control;
+    } else {
+        return .{};
     }
 }
 
