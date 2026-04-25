@@ -473,6 +473,7 @@ pub const Runtime = struct {
             .created => unreachable,
             .running => unreachable,
             .abandoned => unreachable,
+            .deinitialized => unreachable,
             .suspended => switch (ready.loadState()) {
                 .running => {
                     ready.mustTransitionState(.running, .runnable);
@@ -1178,7 +1179,7 @@ fn deinitActorFiber(fiber: *Fiber) void {
             fiber.deinit();
         },
         .created, .completed, .failed, .abandoned => fiber.deinit(),
-        .running => unreachable,
+        .running, .deinitialized => unreachable,
     }
 }
 

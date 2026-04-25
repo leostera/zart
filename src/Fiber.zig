@@ -84,6 +84,7 @@ pub const Status = enum {
     completed,
     failed,
     abandoned,
+    deinitialized,
 };
 
 pub const InitError = error{
@@ -99,6 +100,7 @@ pub const RunError = error{
     Completed,
     Failed,
     Abandoned,
+    Deinitialized,
 };
 
 pub const Entry = *const fn (arg: ?*anyopaque) anyerror!void;
@@ -222,6 +224,7 @@ pub fn run(fiber: *Fiber) RunError!Status {
         .completed => return error.Completed,
         .failed => return error.Failed,
         .abandoned => return error.Abandoned,
+        .deinitialized => return error.Deinitialized,
     }
 
     if (current_fiber == fiber) return error.AlreadyRunning;
@@ -277,7 +280,11 @@ pub fn deinit(fiber: *Fiber) void {
     fiber.checkPinned();
     assert(current_fiber != fiber);
     assert(fiber.state == .created or fiber.state == .completed or fiber.state == .failed or fiber.state == .abandoned);
-    fiber.debugInvalidate();
+    fiber.state = .deinitialized;
+    fiber.failure_error = null;
+    fiber.resumer_context = null;
+    fiber.resumer_fiber = null;
+    fiber.prepared = false;
 }
 
 /// Discards a suspended fiber without unwinding its stack.
@@ -292,10 +299,6 @@ pub fn abandonWithoutUnwind(fiber: *Fiber) void {
     fiber.state = .abandoned;
     fiber.resumer_context = null;
     fiber.resumer_fiber = null;
-}
-
-fn debugInvalidate(fiber: *Fiber) void {
-    if (builtin.mode == .Debug) fiber.* = undefined;
 }
 
 fn checkPinned(fiber: *const Fiber) void {
@@ -1136,6 +1139,21 @@ test "suspended fiber abandonment is explicit" {
 
     try std.testing.expectEqual(Status.abandoned, fiber.status());
     try std.testing.expectError(error.Abandoned, fiber.run());
+}
+
+test "deinit transitions to deinitialized state" {
+    if (!supported) return error.SkipZigTest;
+
+    var stack: [minimum_stack_size]u8 align(stack_alignment) = undefined;
+    var fiber: Fiber = undefined;
+    try init(&fiber, &stack, struct {
+        fn run(_: ?*anyopaque) anyerror!void {}
+    }.run, null);
+
+    fiber.deinit();
+
+    try std.testing.expectEqual(Status.deinitialized, fiber.status());
+    try std.testing.expectError(error.Deinitialized, fiber.run());
 }
 
 test "reentrant run of current fiber is rejected" {

@@ -199,7 +199,7 @@ Current Fiber limitations:
 - No C++ exception or `longjmp` crossing fiber boundaries.
 - No WebAssembly backend yet; Wasm needs an Asyncify/continuation backend, not native stack-pointer switching.
 
-`Fiber.deinit()` rejects suspended fibers. If a runtime intentionally discards a suspended stack without unwinding, it must call `abandonWithoutUnwind()` explicitly; this transitions the fiber to `.abandoned`, and later `run()` returns `error.Abandoned`.
+`Fiber.deinit()` rejects suspended fibers and transitions valid fibers to `.deinitialized`; later `run()` returns `error.Deinitialized`. If a runtime intentionally discards a suspended stack without unwinding, it must call `abandonWithoutUnwind()` explicitly first; that transitions the fiber to `.abandoned`, and later `run()` returns `error.Abandoned`.
 
 ## Tracing
 
