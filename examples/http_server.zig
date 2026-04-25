@@ -5,8 +5,13 @@ const ServeMsg = union(enum) {
     serve,
 };
 
+const AcceptMsg = union(enum) {
+    accept,
+};
+
 const Options = struct {
     port: u16 = 8080,
+    acceptors: usize = 4,
     max_requests: ?usize = null,
     help: bool = false,
 };
@@ -59,11 +64,52 @@ const Connection = struct {
     }
 };
 
+const Acceptor = struct {
+    pub const Msg = AcceptMsg;
+
+    server: std.Io.net.Server,
+    next_request: *std.atomic.Value(usize),
+    max_requests: ?usize,
+
+    pub fn run(self: *@This(), ctx: *zart.Ctx(Msg)) !void {
+        switch (try ctx.recv()) {
+            .accept => try self.acceptLoop(ctx),
+        }
+    }
+
+    fn acceptLoop(self: *@This(), ctx: *zart.Ctx(Msg)) !void {
+        while (true) {
+            if (self.max_requests) |max_requests| {
+                if (self.next_request.load(.acquire) >= max_requests) return;
+            }
+
+            const stream = try self.server.accept(ctx.io());
+            errdefer stream.close(std.Options.debug_io);
+
+            const request_index = self.next_request.fetchAdd(1, .acq_rel) + 1;
+            const connection = try ctx.spawn(Connection{
+                .stream = stream,
+                .request_index = request_index,
+            });
+            try connection.send(.serve);
+
+            if (self.max_requests) |max_requests| {
+                if (request_index >= max_requests) return;
+            }
+        }
+    }
+};
+
 pub fn main(init: std.process.Init) !void {
-    const options = try parseArgs(init);
+    var options = try parseArgs(init);
     if (options.help) {
         printUsage();
         return;
+    }
+    if (options.acceptors == 0) return error.InvalidAcceptorCount;
+    if (options.max_requests != null and options.acceptors != 1) {
+        std.debug.print("bounded runs use one acceptor to avoid leaving parked accept requests\n", .{});
+        options.acceptors = 1;
     }
 
     var actor_io = try zart.io.Default.init();
@@ -79,25 +125,22 @@ pub fn main(init: std.process.Init) !void {
         .reuse_address = true,
     });
     defer server.deinit(init.io);
+    try setNonblocking(server.socket.handle);
 
     std.debug.print("listening on http://127.0.0.1:{d}\n", .{options.port});
+    std.debug.print("acceptors = {d}\n", .{options.acceptors});
     std.debug.print("try: curl http://127.0.0.1:{d}/hello\n", .{options.port});
 
-    var accepted: usize = 0;
-    while (options.max_requests == null or accepted < options.max_requests.?) {
-        const stream = try server.accept(init.io);
-        errdefer stream.close(init.io);
-
-        try setNonblocking(stream.socket.handle);
-
-        accepted += 1;
-        const connection = try rt.spawn(Connection{
-            .stream = stream,
-            .request_index = accepted,
+    var next_request: std.atomic.Value(usize) = .init(0);
+    for (0..options.acceptors) |_| {
+        const acceptor = try rt.spawn(Acceptor{
+            .server = server,
+            .next_request = &next_request,
+            .max_requests = options.max_requests,
         });
-        try connection.send(.serve);
-        try rt.run();
+        try acceptor.send(.accept);
     }
+    try rt.run();
 }
 
 fn parseArgs(init: std.process.Init) !Options {
@@ -113,6 +156,9 @@ fn parseArgs(init: std.process.Init) !Options {
         } else if (std.mem.eql(u8, arg, "--port")) {
             const value = args.next() orelse return error.MissingPort;
             options.port = try std.fmt.parseInt(u16, value, 10);
+        } else if (std.mem.eql(u8, arg, "--acceptors")) {
+            const value = args.next() orelse return error.MissingAcceptors;
+            options.acceptors = try std.fmt.parseInt(usize, value, 10);
         } else if (std.mem.eql(u8, arg, "--max-requests")) {
             const value = args.next() orelse return error.MissingMaxRequests;
             options.max_requests = try std.fmt.parseInt(usize, value, 10);
@@ -127,10 +173,11 @@ fn parseArgs(init: std.process.Init) !Options {
 
 fn printUsage() void {
     std.debug.print(
-        \\usage: zig build example-http_server -- [--port N] [--max-requests N]
+        \\usage: zig build example-http_server -- [--port N] [--acceptors N] [--max-requests N]
         \\
         \\examples:
         \\  zig build example-http_server
+        \\  zig build example-http_server -- --port 8081 --acceptors 8
         \\  zig build example-http_server -- --port 8081 --max-requests 1
         \\
     , .{});

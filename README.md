@@ -179,7 +179,7 @@ They cover typed request/reply actors, ping-pong messaging, fan-out aggregation,
 The HTTP server runs until interrupted by default:
 
 ```sh
-zig build example-http_server -- --port 8080
+zig build example-http_server -- --port 8080 --acceptors 4
 curl http://127.0.0.1:8080/hello
 ```
 

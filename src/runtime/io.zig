@@ -51,6 +51,7 @@ pub const RuntimeIo = struct {
             operate: Operate,
             file_read_positional: FileReadPositional,
             file_write_positional: FileWritePositional,
+            net_accept: NetAccept,
             net_read: NetRead,
             net_write: NetWrite,
             batch_await_async: BatchAwaitAsync,
@@ -77,6 +78,12 @@ pub const RuntimeIo = struct {
             splat: usize,
             offset: u64,
             result: std.Io.File.WritePositionalError!usize = undefined,
+        };
+
+        pub const NetAccept = struct {
+            server: std.Io.net.Socket.Handle,
+            options: std.Io.net.Server.AcceptOptions,
+            result: std.Io.net.Server.AcceptError!std.Io.net.Socket = undefined,
         };
 
         pub const NetRead = struct {
@@ -148,6 +155,18 @@ pub const RuntimeIo = struct {
                         .data = data,
                         .splat = splat,
                         .offset = offset,
+                    },
+                },
+            };
+        }
+
+        pub fn initNetAccept(actor: *anyopaque, server: std.Io.net.Socket.Handle, options: std.Io.net.Server.AcceptOptions) Request {
+            return .{
+                .actor = actor,
+                .payload = .{
+                    .net_accept = .{
+                        .server = server,
+                        .options = options,
                     },
                 },
             };
@@ -227,6 +246,11 @@ pub const RuntimeIo = struct {
 
         pub fn completeFileWritePositional(request: *Request, result: std.Io.File.WritePositionalError!usize) void {
             request.payload.file_write_positional.result = result;
+            request.complete();
+        }
+
+        pub fn completeNetAccept(request: *Request, result: std.Io.net.Server.AcceptError!std.Io.net.Socket) void {
+            request.payload.net_accept.result = result;
             request.complete();
         }
 
@@ -525,6 +549,7 @@ const actor_io_vtable: std.Io.VTable = blk: {
     vtable.batchCancel = actorIoBatchCancel;
     vtable.fileReadPositional = actorIoFileReadPositional;
     vtable.fileWritePositional = actorIoFileWritePositional;
+    vtable.netAccept = actorIoNetAccept;
     vtable.netRead = actorIoNetRead;
     vtable.netWrite = actorIoNetWrite;
     vtable.sleep = actorIoSleep;
@@ -731,6 +756,23 @@ fn actorIoFileWritePositional(
     defer context.charge();
     const base = context.runtime_io.baseIo();
     return base.vtable.fileWritePositional(base.userdata, file, header, data, splat, offset);
+}
+
+fn actorIoNetAccept(
+    userdata: ?*anyopaque,
+    server: std.Io.net.Socket.Handle,
+    options: std.Io.net.Server.AcceptOptions,
+) std.Io.net.Server.AcceptError!std.Io.net.Socket {
+    const context = actorIoContext(userdata);
+    if (context.runtime_io.hasDriver()) {
+        var request: RuntimeIo.Request = .initNetAccept(context.charge_actor, server, options);
+        context.wait(&request);
+        return request.payload.net_accept.result;
+    }
+
+    defer context.charge();
+    const base = context.runtime_io.baseIo();
+    return base.vtable.netAccept(base.userdata, server, options);
 }
 
 fn actorIoNetRead(

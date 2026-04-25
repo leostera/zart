@@ -274,6 +274,17 @@ pub const Posix = struct {
                 request.completeFileWritePositional(result);
                 return true;
             },
+            .net_accept => |op| {
+                const result = netAccept(op.server, op.options) catch |err| switch (err) {
+                    error.WouldBlock => return false,
+                    else => |e| {
+                        request.completeNetAccept(e);
+                        return true;
+                    },
+                };
+                request.completeNetAccept(result);
+                return true;
+            },
             .net_read => |op| {
                 const result = netRead(op.handle, op.data) catch |err| switch (err) {
                     error.WouldBlock => return false,
@@ -363,6 +374,7 @@ fn fdOf(request: *const RuntimeIo.Request) posix.fd_t {
         },
         .file_read_positional => |op| op.file.handle,
         .file_write_positional => |op| op.file.handle,
+        .net_accept => |op| op.server,
         .net_read => |op| op.handle,
         .net_write => |op| op.handle,
         .sleep, .batch_await_async, .batch_await_concurrent => -1,
@@ -376,7 +388,7 @@ fn interestOf(request: *const RuntimeIo.Request) Interest {
             .file_write_streaming => .write,
             .device_io_control => .read,
         },
-        .file_read_positional, .net_read => .read,
+        .file_read_positional, .net_accept, .net_read => .read,
         .file_write_positional, .net_write => .write,
         .sleep, .batch_await_async, .batch_await_concurrent => .read,
     };
@@ -418,6 +430,43 @@ fn fileWritePositional(
     return pwrite(file.handle, buffer, offset);
 }
 
+const PosixAddress = extern union {
+    any: posix.sockaddr,
+    in: posix.sockaddr.in,
+    in6: posix.sockaddr.in6,
+};
+
+fn netAccept(server: net.Socket.Handle, options: net.Server.AcceptOptions) (net.Server.AcceptError || error{WouldBlock})!net.Socket {
+    _ = options;
+
+    var storage: PosixAddress = undefined;
+    var addr_len: posix.socklen_t = @sizeOf(PosixAddress);
+    const fd: posix.fd_t = while (true) {
+        const rc = posix.system.accept(server, &storage.any, &addr_len);
+        switch (posix.errno(rc)) {
+            .SUCCESS => break @intCast(rc),
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            .BADF => return error.Unexpected,
+            .CONNABORTED => return error.ConnectionAborted,
+            .INVAL => return error.SocketNotListening,
+            .MFILE => return error.ProcessFdQuotaExceeded,
+            .NFILE => return error.SystemFdQuotaExceeded,
+            .NOBUFS, .NOMEM => return error.SystemResources,
+            .PROTO => return error.ProtocolFailure,
+            .PERM => return error.BlockedByFirewall,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    };
+    errdefer closeFd(fd);
+
+    try setNonblocking(fd);
+    return .{
+        .handle = fd,
+        .address = addressFromPosix(&storage),
+    };
+}
+
 fn netRead(handle: net.Socket.Handle, data: [][]u8) (net.Stream.Reader.Error || error{WouldBlock})!usize {
     const buffer = firstMutableBuffer(data) orelse return 0;
     return posix.read(handle, buffer) catch |err| switch (err) {
@@ -439,6 +488,30 @@ fn netWrite(
     if (header.len != 0) return writeSocketFd(handle, header);
     const buffer = firstConstBuffer(data, splat) orelse return 0;
     return writeSocketFd(handle, buffer);
+}
+
+fn addressFromPosix(posix_address: *const PosixAddress) net.IpAddress {
+    return switch (posix_address.any.family) {
+        posix.AF.INET => .{ .ip4 = address4FromPosix(&posix_address.in) },
+        posix.AF.INET6 => .{ .ip6 = address6FromPosix(&posix_address.in6) },
+        else => .{ .ip4 = .loopback(0) },
+    };
+}
+
+fn address4FromPosix(in: *const posix.sockaddr.in) net.Ip4Address {
+    return .{
+        .port = std.mem.bigToNative(u16, in.port),
+        .bytes = @bitCast(in.addr),
+    };
+}
+
+fn address6FromPosix(in6: *const posix.sockaddr.in6) net.Ip6Address {
+    return .{
+        .port = std.mem.bigToNative(u16, in6.port),
+        .bytes = in6.addr,
+        .flow = in6.flowinfo,
+        .interface = .{ .index = in6.scope_id },
+    };
 }
 
 fn writeData(fd: posix.fd_t, data: []const []const u8, splat: usize) (File.Writer.Error || error{WouldBlock})!usize {

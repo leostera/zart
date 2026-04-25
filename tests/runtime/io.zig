@@ -747,6 +747,66 @@ test "posix io driver writes files through ctx io" {
     try testing.expectEqualStrings("hello", out[0..len]);
 }
 
+test "posix io driver parks socket accepts until a client connects" {
+    const testing = std.testing;
+
+    const AcceptMsg = union(enum) {
+        start,
+    };
+
+    const Acceptor = struct {
+        pub const Msg = AcceptMsg;
+
+        server: std.Io.net.Server,
+        accepted: *bool,
+
+        pub fn run(self: *@This(), ctx: *Ctx(Msg)) !void {
+            switch (try ctx.recv()) {
+                .start => {
+                    const stream = try self.server.accept(ctx.io());
+                    defer stream.close(std.Options.debug_io);
+                    self.accepted.* = true;
+                },
+            }
+        }
+    };
+
+    const Connector = struct {
+        address: std.Io.net.IpAddress,
+
+        fn run(self: @This()) void {
+            sleepMs(10);
+            const stream = self.address.connect(std.Options.debug_io, .{ .mode = .stream }) catch return;
+            stream.close(std.Options.debug_io);
+        }
+    };
+
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(testing.io, .{ .reuse_address = true });
+    defer server.deinit(testing.io);
+    try setNonblocking(server.socket.handle);
+
+    var posix_io = try DefaultIo.init();
+    defer posix_io.deinit();
+
+    var rt = try Runtime.init(testing.allocator, .{ .worker_count = 1, .io = posix_io.driver() });
+    defer rt.deinit();
+
+    var accepted = false;
+    const acceptor = try rt.spawn(Acceptor{
+        .server = server,
+        .accepted = &accepted,
+    });
+
+    const connector = try std.Thread.spawn(.{}, Connector.run, .{Connector{ .address = server.socket.address }});
+    defer connector.join();
+
+    try acceptor.send(.start);
+    try rt.run();
+
+    try testing.expect(accepted);
+}
+
 test "posix io driver parks socket reads until another actor writes" {
     const testing = std.testing;
 
