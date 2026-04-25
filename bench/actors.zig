@@ -251,6 +251,7 @@ const ImmediateIoDriver = struct {
             .operate => request.completeOperate(.{ .file_read_streaming = 0 }),
             .file_read_positional,
             .file_write_positional,
+            .net_accept,
             .net_read,
             .net_write,
             => unreachable,

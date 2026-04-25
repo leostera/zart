@@ -3,12 +3,16 @@
 const builtin = @import("builtin");
 
 pub const posix = @import("io/posix.zig");
+pub const kqueue = @import("io/kqueue.zig");
+pub const uring = @import("io/uring.zig");
 
+pub const Kqueue = kqueue.Kqueue;
 pub const Posix = posix.Posix;
-pub const PosixIo = Posix;
+pub const PosixPoll = Posix;
+pub const Uring = uring.Uring;
 
 pub const Default = switch (builtin.os.tag) {
-    .linux,
+    .linux => Uring,
     .dragonfly,
     .freebsd,
     .netbsd,
@@ -20,7 +24,7 @@ pub const Default = switch (builtin.os.tag) {
     .tvos,
     .visionos,
     .watchos,
-    => Posix,
+    => Kqueue,
     else => Unsupported,
 };
 

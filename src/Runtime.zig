@@ -24,7 +24,9 @@ pub const IoDriver = RuntimeIo.Driver;
 pub const IoPollMode = RuntimeIo.PollMode;
 pub const IoRequest = RuntimeIo.Request;
 pub const DefaultIo = concrete_io.Default;
-pub const PosixIo = concrete_io.Posix;
+pub const KqueueIo = concrete_io.Kqueue;
+pub const UringIo = concrete_io.Uring;
+pub const PosixPollIo = concrete_io.PosixPoll;
 
 const ActorIoContext = io.ActorIoContext;
 const RuntimeIo = io.RuntimeIo;

@@ -13,7 +13,7 @@ const posix = std.posix;
 const net = std.Io.net;
 const File = std.Io.File;
 
-const Interest = enum {
+pub const Interest = enum {
     read,
     write,
 };
@@ -56,7 +56,7 @@ pub const Posix = struct {
 
     fn submit(context: ?*anyopaque, request: *RuntimeIo.Request) void {
         const self: *Self = @ptrCast(@alignCast(context.?));
-        if (self.tryComplete(request)) return;
+        if (tryComplete(request)) return;
 
         self.mutex.lockUncancelable(std.Options.debug_io);
         if (std.debug.runtime_safety) self.assertNotPending(request);
@@ -144,7 +144,7 @@ pub const Posix = struct {
                 false;
             index += 1;
 
-            if (ready and self.tryComplete(request)) {
+            if (ready and tryComplete(request)) {
                 if (previous) |prev| {
                     prev.next = next;
                 } else {
@@ -209,118 +209,6 @@ pub const Posix = struct {
             }
         }
     }
-
-    fn tryComplete(_: *Self, request: *RuntimeIo.Request) bool {
-        switch (request.payload) {
-            .operate => |operation| switch (operation.operation) {
-                .file_read_streaming => |op| {
-                    const result = fileReadStreaming(op.file, op.data) catch |err| switch (err) {
-                        error.WouldBlock => return false,
-                        error.Canceled => {
-                            request.completeOperate(error.Canceled);
-                            return true;
-                        },
-                        else => |e| {
-                            request.completeOperate(.{ .file_read_streaming = e });
-                            return true;
-                        },
-                    };
-                    request.completeOperate(.{ .file_read_streaming = result });
-                    return true;
-                },
-                .file_write_streaming => |op| {
-                    const result = fileWriteStreaming(op.file, op.header, op.data, op.splat) catch |err| switch (err) {
-                        error.WouldBlock => return false,
-                        error.Canceled => {
-                            request.completeOperate(error.Canceled);
-                            return true;
-                        },
-                        else => |e| {
-                            request.completeOperate(.{ .file_write_streaming = e });
-                            return true;
-                        },
-                    };
-                    request.completeOperate(.{ .file_write_streaming = result });
-                    return true;
-                },
-                .net_receive => {
-                    request.completeOperate(error.Canceled);
-                    return true;
-                },
-                .device_io_control => {
-                    request.completeOperate(error.Canceled);
-                    return true;
-                },
-            },
-            .file_read_positional => |op| {
-                const result = fileReadPositional(op.file, op.data, op.offset) catch |err| switch (err) {
-                    error.WouldBlock => return false,
-                    else => |e| {
-                        request.completeFileReadPositional(e);
-                        return true;
-                    },
-                };
-                request.completeFileReadPositional(result);
-                return true;
-            },
-            .file_write_positional => |op| {
-                const result = fileWritePositional(op.file, op.header, op.data, op.splat, op.offset) catch |err| switch (err) {
-                    error.WouldBlock => return false,
-                    else => |e| {
-                        request.completeFileWritePositional(e);
-                        return true;
-                    },
-                };
-                request.completeFileWritePositional(result);
-                return true;
-            },
-            .net_accept => |op| {
-                const result = netAccept(op.server, op.options) catch |err| switch (err) {
-                    error.WouldBlock => return false,
-                    else => |e| {
-                        request.completeNetAccept(e);
-                        return true;
-                    },
-                };
-                request.completeNetAccept(result);
-                return true;
-            },
-            .net_read => |op| {
-                const result = netRead(op.handle, op.data) catch |err| switch (err) {
-                    error.WouldBlock => return false,
-                    else => |e| {
-                        request.completeNetRead(e);
-                        return true;
-                    },
-                };
-                request.completeNetRead(result);
-                return true;
-            },
-            .net_write => |op| {
-                const result = netWrite(op.handle, op.header, op.data, op.splat) catch |err| switch (err) {
-                    error.WouldBlock => return false,
-                    else => |e| {
-                        request.completeNetWrite(e);
-                        return true;
-                    },
-                };
-                request.completeNetWrite(result);
-                return true;
-            },
-            .sleep => {
-                request.completeSleep({});
-                return true;
-            },
-            .batch_await_async => {
-                request.completeBatchAwaitAsync({});
-                return true;
-            },
-            .batch_await_concurrent => {
-                request.completeBatchAwaitConcurrent({});
-                return true;
-            },
-        }
-    }
 };
 
 fn createWakePipe() ![2]posix.fd_t {
@@ -341,7 +229,7 @@ fn createWakePipe() ![2]posix.fd_t {
     return fds;
 }
 
-fn setNonblocking(fd: posix.fd_t) !void {
+pub fn setNonblocking(fd: posix.fd_t) !void {
     var flags: usize = while (true) {
         const rc = posix.system.fcntl(fd, posix.F.GETFL, @as(usize, 0));
         switch (posix.errno(rc)) {
@@ -360,11 +248,11 @@ fn setNonblocking(fd: posix.fd_t) !void {
     }
 }
 
-fn closeFd(fd: posix.fd_t) void {
+pub fn closeFd(fd: posix.fd_t) void {
     _ = posix.system.close(fd);
 }
 
-fn fdOf(request: *const RuntimeIo.Request) posix.fd_t {
+pub fn fdOf(request: *const RuntimeIo.Request) posix.fd_t {
     return switch (request.payload) {
         .operate => |op| switch (op.operation) {
             .file_read_streaming => |file_op| file_op.file.handle,
@@ -381,7 +269,7 @@ fn fdOf(request: *const RuntimeIo.Request) posix.fd_t {
     };
 }
 
-fn interestOf(request: *const RuntimeIo.Request) Interest {
+pub fn interestOf(request: *const RuntimeIo.Request) Interest {
     return switch (request.payload) {
         .operate => |op| switch (op.operation) {
             .file_read_streaming, .net_receive => .read,
@@ -399,6 +287,118 @@ fn pollEvents(interest: Interest) i16 {
         .read => @intCast(posix.POLL.IN),
         .write => @intCast(posix.POLL.OUT),
     };
+}
+
+pub fn tryComplete(request: *RuntimeIo.Request) bool {
+    switch (request.payload) {
+        .operate => |operation| switch (operation.operation) {
+            .file_read_streaming => |op| {
+                const result = fileReadStreaming(op.file, op.data) catch |err| switch (err) {
+                    error.WouldBlock => return false,
+                    error.Canceled => {
+                        request.completeOperate(error.Canceled);
+                        return true;
+                    },
+                    else => |e| {
+                        request.completeOperate(.{ .file_read_streaming = e });
+                        return true;
+                    },
+                };
+                request.completeOperate(.{ .file_read_streaming = result });
+                return true;
+            },
+            .file_write_streaming => |op| {
+                const result = fileWriteStreaming(op.file, op.header, op.data, op.splat) catch |err| switch (err) {
+                    error.WouldBlock => return false,
+                    error.Canceled => {
+                        request.completeOperate(error.Canceled);
+                        return true;
+                    },
+                    else => |e| {
+                        request.completeOperate(.{ .file_write_streaming = e });
+                        return true;
+                    },
+                };
+                request.completeOperate(.{ .file_write_streaming = result });
+                return true;
+            },
+            .net_receive => {
+                request.completeOperate(error.Canceled);
+                return true;
+            },
+            .device_io_control => {
+                request.completeOperate(error.Canceled);
+                return true;
+            },
+        },
+        .file_read_positional => |op| {
+            const result = fileReadPositional(op.file, op.data, op.offset) catch |err| switch (err) {
+                error.WouldBlock => return false,
+                else => |e| {
+                    request.completeFileReadPositional(e);
+                    return true;
+                },
+            };
+            request.completeFileReadPositional(result);
+            return true;
+        },
+        .file_write_positional => |op| {
+            const result = fileWritePositional(op.file, op.header, op.data, op.splat, op.offset) catch |err| switch (err) {
+                error.WouldBlock => return false,
+                else => |e| {
+                    request.completeFileWritePositional(e);
+                    return true;
+                },
+            };
+            request.completeFileWritePositional(result);
+            return true;
+        },
+        .net_accept => |op| {
+            const result = netAccept(op.server, op.options) catch |err| switch (err) {
+                error.WouldBlock => return false,
+                else => |e| {
+                    request.completeNetAccept(e);
+                    return true;
+                },
+            };
+            request.completeNetAccept(result);
+            return true;
+        },
+        .net_read => |op| {
+            const result = netRead(op.handle, op.data) catch |err| switch (err) {
+                error.WouldBlock => return false,
+                else => |e| {
+                    request.completeNetRead(e);
+                    return true;
+                },
+            };
+            request.completeNetRead(result);
+            return true;
+        },
+        .net_write => |op| {
+            const result = netWrite(op.handle, op.header, op.data, op.splat) catch |err| switch (err) {
+                error.WouldBlock => return false,
+                else => |e| {
+                    request.completeNetWrite(e);
+                    return true;
+                },
+            };
+            request.completeNetWrite(result);
+            return true;
+        },
+        .sleep => {
+            request.completeSleep({});
+            return true;
+        },
+        .batch_await_async => {
+            request.completeBatchAwaitAsync({});
+            return true;
+        },
+        .batch_await_concurrent => {
+            request.completeBatchAwaitConcurrent({});
+            return true;
+        },
+    }
 }
 
 fn fileReadStreaming(file: File, data: []const []u8) File.ReadStreamingError!usize {
