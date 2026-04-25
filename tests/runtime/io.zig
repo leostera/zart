@@ -154,7 +154,7 @@ test "std Io calls consume io budget and yield cooperatively" {
     try testing.expectEqualStrings("axbc", trace.slice());
 }
 
-test "std Io operate parks actor until non-blocking driver completion" {
+test "std Io operate keeps synchronous driver completions on the current actor turn" {
     const testing = std.testing;
 
     const FakeDriver = struct {
@@ -257,7 +257,7 @@ test "std Io operate parks actor until non-blocking driver completion" {
     try other.send(.hit);
     try rt.run();
 
-    try testing.expectEqualStrings("abc", trace.slice());
+    try testing.expectEqualStrings("acb", trace.slice());
     try testing.expectEqual(@as(usize, 1), fake_driver.operate_calls);
 }
 
@@ -362,7 +362,7 @@ test "pending non-blocking io can complete after run returns" {
     try testing.expectEqual(@as(?*IoRequest, null), fake_driver.pending);
 }
 
-test "std Io batch waits park actor until non-blocking driver completion" {
+test "std Io batch waits keep synchronous driver completions on the current actor turn" {
     const testing = std.testing;
 
     const FakeDriver = struct {
@@ -468,7 +468,7 @@ test "std Io batch waits park actor until non-blocking driver completion" {
     try other.send(.hit);
     try rt.run();
 
-    try testing.expectEqualStrings("abcd", trace.slice());
+    try testing.expectEqualStrings("acdb", trace.slice());
     try testing.expectEqual(@as(usize, 1), fake_driver.async_calls);
     try testing.expectEqual(@as(usize, 1), fake_driver.concurrent_calls);
 }

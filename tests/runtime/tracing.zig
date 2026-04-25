@@ -4,6 +4,7 @@ const Actor = common.Actor;
 const ActorId = common.ActorId;
 const Ctx = common.Ctx;
 const IoDriver = common.IoDriver;
+const IoPollMode = common.IoPollMode;
 const IoRequest = common.IoRequest;
 const Runtime = common.Runtime;
 const TraceEvent = common.TraceEvent;
@@ -230,17 +231,27 @@ test "tracer records actor io events" {
     const testing = std.testing;
 
     const FakeDriver = struct {
+        pending: ?*IoRequest = null,
+
         const Self = @This();
 
         fn driver(self: *Self) IoDriver {
             return .{
                 .context = self,
                 .submit_fn = submit,
+                .poll_fn = poll,
             };
         }
 
         fn submit(context: ?*anyopaque, request: *IoRequest) void {
-            _ = context;
+            const self: *Self = @ptrCast(@alignCast(context.?));
+            self.pending = request;
+        }
+
+        fn poll(context: ?*anyopaque, _: IoPollMode) !void {
+            const self: *Self = @ptrCast(@alignCast(context.?));
+            const request = self.pending orelse return;
+            self.pending = null;
             request.completeOperate(.{ .file_read_streaming = 1 });
         }
     };

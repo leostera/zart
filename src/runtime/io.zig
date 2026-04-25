@@ -295,6 +295,12 @@ pub const RuntimeIo = struct {
         notify_fn: ?*const fn (?*anyopaque, *Request) void = null,
     };
 
+    pub const ActorCompletion = struct {
+        shared: *Shared,
+        in_submit: std.atomic.Value(bool) = .init(true),
+        completed_synchronously: std.atomic.Value(bool) = .init(false),
+    };
+
     pub fn init(allocator: std.mem.Allocator, driver: ?Driver) InitError!RuntimeIo {
         const shared = try allocator.create(Shared);
         errdefer allocator.destroy(shared);
@@ -329,14 +335,21 @@ pub const RuntimeIo = struct {
         const shared = runtime_io.shared;
         const driver = shared.driver orelse @panic("actor I/O submitted without an I/O driver");
 
-        request.next = null;
-        request.completion_next = null;
-        request.complete_context = shared;
-        request.complete_fn = completeRequest;
-        request.completed.store(false, .monotonic);
-        _ = shared.pending_count.fetchAdd(1, .release);
+        prepareRequest(shared, request, shared, completeRequest);
 
         driver.submit(request);
+    }
+
+    pub fn submitActor(runtime_io: *RuntimeIo, request: *Request, completion: *ActorCompletion) bool {
+        const shared = runtime_io.shared;
+        const driver = shared.driver orelse @panic("actor I/O submitted without an I/O driver");
+
+        completion.* = .{ .shared = shared };
+        prepareRequest(shared, request, completion, completeActorRequest);
+
+        driver.submit(request);
+        completion.in_submit.store(false, .release);
+        return completion.completed_synchronously.load(.acquire);
     }
 
     pub fn setCompletionNotify(
@@ -386,9 +399,45 @@ pub const RuntimeIo = struct {
     fn completeRequest(context: ?*anyopaque, request: *Request) void {
         const shared: *Shared = @ptrCast(@alignCast(context.?));
 
+        markCompleted(request);
+        enqueueCompletion(shared, request);
+    }
+
+    fn completeActorRequest(context: ?*anyopaque, request: *Request) void {
+        const completion: *ActorCompletion = @ptrCast(@alignCast(context.?));
+        const shared = completion.shared;
+
+        markCompleted(request);
+        if (completion.in_submit.load(.acquire)) {
+            completion.completed_synchronously.store(true, .release);
+            _ = shared.pending_count.fetchSub(1, .acq_rel);
+            return;
+        }
+
+        enqueueCompletion(shared, request);
+    }
+
+    fn prepareRequest(
+        shared: *Shared,
+        request: *Request,
+        complete_context: ?*anyopaque,
+        complete_fn: *const fn (?*anyopaque, *Request) void,
+    ) void {
+        request.next = null;
+        request.completion_next = null;
+        request.complete_context = complete_context;
+        request.complete_fn = complete_fn;
+        request.completed.store(false, .monotonic);
+        _ = shared.pending_count.fetchAdd(1, .release);
+    }
+
+    fn markCompleted(request: *Request) void {
         if (request.completed.swap(true, .acq_rel)) {
             @panic("I/O request completed more than once");
         }
+    }
+
+    fn enqueueCompletion(shared: *Shared, request: *Request) void {
         var head = shared.completions_incoming.load(.monotonic);
         while (true) {
             request.completion_next = head;
@@ -524,7 +573,8 @@ pub const ActorIoContext = struct {
     }
 
     fn wait(context: *ActorIoContext, request: *RuntimeIo.Request) void {
-        context.runtime_io.submit(request);
+        var completion: RuntimeIo.ActorCompletion = undefined;
+        if (context.runtime_io.submitActor(request, &completion)) return;
 
         // Always park once so the scheduler drains the completion before the
         // actor can return and unwind this stack-backed request.
