@@ -42,7 +42,7 @@ pub const stack_grows_down = true;
 
 const native_os = builtin.os.tag;
 const is_x86_64_sysv = builtin.cpu.arch == .x86_64 and switch (native_os) {
-    .linux, .macos, .freebsd, .openbsd, .netbsd, .dragonfly, .solaris => true,
+    .linux, .macos, .freebsd, .openbsd, .netbsd, .dragonfly => true,
     else => false,
 };
 const is_aarch64_aapcs64_basic = builtin.cpu.arch == .aarch64 and switch (native_os) {
@@ -507,6 +507,7 @@ fn verifyContextLayout() void {
 }
 
 extern fn zart_fiber_capture_x86_fp_control(out: *X86FpControl) callconv(.c) void;
+extern fn zart_fiber_set_x86_fp_control(control: *const X86FpControl) callconv(.c) void;
 
 extern fn zart_fiber_switch(prev: *Context, next: *const Context) callconv(.c) void;
 
@@ -525,7 +526,10 @@ comptime {
             // Save the current continuation into `prev`:
             //   sp is the current stack pointer.
             //   pc is the local resume label `1`.
-            //   x19-x30 and d8-d15 are the AAPCS64 preserved register set.
+            //   x19-x29 and SP are the AAPCS64 callee-saved GPR state.
+            //   d8-d15 store the ABI-preserved low 64 bits of v8-v15.
+            //   x30/LR is saved because this switch function's own return
+            //   continuation lives there while the context is suspended.
             //
             // Restore `next` in the opposite order, install its stack pointer,
             // and branch to its saved pc. When this saved context is resumed in
@@ -610,14 +614,20 @@ comptime {
 comptime {
     if (is_x86_64_sysv) {
         const prefix = if (builtin.object_format == .macho) "_" else "";
-        const symbol = prefix ++ "zart_fiber_capture_x86_fp_control";
+        const capture_symbol = prefix ++ "zart_fiber_capture_x86_fp_control";
+        const set_symbol = prefix ++ "zart_fiber_set_x86_fp_control";
 
         asm (".text\n" ++
-                ".globl " ++ symbol ++ "\n" ++
-                symbol ++ ":\n" ++
+                ".globl " ++ capture_symbol ++ "\n" ++
+                capture_symbol ++ ":\n" ++
                 "    stmxcsr 0(%rdi)\n" ++
                 "    fnstcw 4(%rdi)\n" ++
                 "    movw $0, 6(%rdi)\n" ++
+                "    retq\n" ++
+                ".globl " ++ set_symbol ++ "\n" ++
+                set_symbol ++ ":\n" ++
+                "    ldmxcsr 0(%rdi)\n" ++
+                "    fldcw 4(%rdi)\n" ++
                 "    retq\n");
     }
 }
@@ -632,6 +642,14 @@ fn captureX86FpControl() X86FpControl {
     }
 }
 
+fn setX86FpControl(control: X86FpControl) void {
+    if (comptime is_x86_64_sysv) {
+        zart_fiber_set_x86_fp_control(&control);
+    } else {
+        unreachable;
+    }
+}
+
 fn switchContext(prev: *Context, next: *const Context) void {
     if (comptime supported) {
         zart_fiber_switch(prev, next);
@@ -640,13 +658,13 @@ fn switchContext(prev: *Context, next: *const Context) void {
     }
 }
 
-const preserved_register_test_count = if (is_aarch64_aapcs64_basic) 18 else if (is_x86_64_sysv) 5 else 0;
+const preserved_register_test_count = if (is_aarch64_aapcs64_basic) 19 else if (is_x86_64_sysv) 6 else 0;
 
 const PreservedRegisterProbe = extern struct {
     // Test-only assembly treats this as two adjacent arrays. `observed` starts
     // immediately after `expected`, so the observed offset is:
-    //   AArch64: 18 registers * 8 bytes = 144
-    //   x86_64:  5 registers * 8 bytes = 40
+    //   AArch64: 19 registers * 8 bytes = 152
+    //   x86_64:  6 registers * 8 bytes = 48
     expected: [preserved_register_test_count]usize,
     observed: [preserved_register_test_count]usize = undefined,
 };
@@ -654,12 +672,12 @@ const PreservedRegisterProbe = extern struct {
 fn verifyPreservedRegisterProbeLayout() void {
     if (comptime is_aarch64_aapcs64_basic) {
         expectOffset(PreservedRegisterProbe, "expected", 0);
-        expectOffset(PreservedRegisterProbe, "observed", 144);
-        expectSize(PreservedRegisterProbe, 288);
+        expectOffset(PreservedRegisterProbe, "observed", 152);
+        expectSize(PreservedRegisterProbe, 304);
     } else if (comptime is_x86_64_sysv) {
         expectOffset(PreservedRegisterProbe, "expected", 0);
-        expectOffset(PreservedRegisterProbe, "observed", 40);
-        expectSize(PreservedRegisterProbe, 80);
+        expectOffset(PreservedRegisterProbe, "observed", 48);
+        expectSize(PreservedRegisterProbe, 96);
     }
 }
 
@@ -667,6 +685,8 @@ extern fn zart_fiber_probe_preserved_registers(
     probe: *PreservedRegisterProbe,
     yield_fn: *const fn () callconv(.c) void,
 ) callconv(.c) void;
+
+extern fn zart_fiber_read_stack_pointer() callconv(.c) usize;
 
 comptime {
     if (supported and builtin.is_test) {
@@ -716,26 +736,28 @@ comptime {
                     "    ldr x26, [x0, #56]\n" ++
                     "    ldr x27, [x0, #64]\n" ++
                     "    ldr x28, [x0, #72]\n" ++
-                    "    ldp d8, d9, [x0, #80]\n" ++
-                    "    ldp d10, d11, [x0, #96]\n" ++
-                    "    ldp d12, d13, [x0, #112]\n" ++
-                    "    ldp d14, d15, [x0, #128]\n" ++
+                    "    ldr x29, [x0, #80]\n" ++
+                    "    ldp d8, d9, [x0, #88]\n" ++
+                    "    ldp d10, d11, [x0, #104]\n" ++
+                    "    ldp d12, d13, [x0, #120]\n" ++
+                    "    ldp d14, d15, [x0, #136]\n" ++
                     "    blr x1\n" ++
                     "    ldr x9, [sp, #96]\n" ++
-                    "    str x19, [x9, #144]\n" ++
-                    "    str x20, [x9, #152]\n" ++
-                    "    str x21, [x9, #160]\n" ++
-                    "    str x22, [x9, #168]\n" ++
-                    "    str x23, [x9, #176]\n" ++
-                    "    str x24, [x9, #184]\n" ++
-                    "    str x25, [x9, #192]\n" ++
-                    "    str x26, [x9, #200]\n" ++
-                    "    str x27, [x9, #208]\n" ++
-                    "    str x28, [x9, #216]\n" ++
-                    "    stp d8, d9, [x9, #224]\n" ++
-                    "    stp d10, d11, [x9, #240]\n" ++
-                    "    stp d12, d13, [x9, #256]\n" ++
-                    "    stp d14, d15, [x9, #272]\n" ++
+                    "    str x19, [x9, #152]\n" ++
+                    "    str x20, [x9, #160]\n" ++
+                    "    str x21, [x9, #168]\n" ++
+                    "    str x22, [x9, #176]\n" ++
+                    "    str x23, [x9, #184]\n" ++
+                    "    str x24, [x9, #192]\n" ++
+                    "    str x25, [x9, #200]\n" ++
+                    "    str x26, [x9, #208]\n" ++
+                    "    str x27, [x9, #216]\n" ++
+                    "    str x28, [x9, #224]\n" ++
+                    "    str x29, [x9, #232]\n" ++
+                    "    stp d8, d9, [x9, #240]\n" ++
+                    "    stp d10, d11, [x9, #256]\n" ++
+                    "    stp d12, d13, [x9, #272]\n" ++
+                    "    stp d14, d15, [x9, #288]\n" ++
                     "    ldp x19, x20, [sp, #0]\n" ++
                     "    ldp x21, x22, [sp, #16]\n" ++
                     "    ldp x23, x24, [sp, #32]\n" ++
@@ -755,37 +777,56 @@ comptime {
             //   rdi = PreservedRegisterProbe *
             //   rsi = C-callable yield function
             //
-            // The five pushes preserve the caller's SysV callee-saved GPRs.
-            // The extra 16-byte allocation keeps `%rsp` 16-byte aligned before
+            // The six pushes preserve the caller's SysV callee-saved GPRs.
+            // The extra 24-byte allocation keeps `%rsp` 16-byte aligned before
             // `callq *%rsi` and provides a spill slot for the probe pointer.
             asm (".text\n" ++
                     ".globl " ++ symbol ++ "\n" ++
                     symbol ++ ":\n" ++
                     "    pushq %rbx\n" ++
+                    "    pushq %rbp\n" ++
                     "    pushq %r12\n" ++
                     "    pushq %r13\n" ++
                     "    pushq %r14\n" ++
                     "    pushq %r15\n" ++
-                    "    subq $16, %rsp\n" ++
+                    "    subq $24, %rsp\n" ++
                     "    movq %rdi, 0(%rsp)\n" ++
                     "    movq 0(%rdi), %rbx\n" ++
-                    "    movq 8(%rdi), %r12\n" ++
-                    "    movq 16(%rdi), %r13\n" ++
-                    "    movq 24(%rdi), %r14\n" ++
-                    "    movq 32(%rdi), %r15\n" ++
+                    "    movq 8(%rdi), %rbp\n" ++
+                    "    movq 16(%rdi), %r12\n" ++
+                    "    movq 24(%rdi), %r13\n" ++
+                    "    movq 32(%rdi), %r14\n" ++
+                    "    movq 40(%rdi), %r15\n" ++
                     "    callq *%rsi\n" ++
                     "    movq 0(%rsp), %rax\n" ++
-                    "    movq %rbx, 40(%rax)\n" ++
-                    "    movq %r12, 48(%rax)\n" ++
-                    "    movq %r13, 56(%rax)\n" ++
-                    "    movq %r14, 64(%rax)\n" ++
-                    "    movq %r15, 72(%rax)\n" ++
-                    "    addq $16, %rsp\n" ++
+                    "    movq %rbx, 48(%rax)\n" ++
+                    "    movq %rbp, 56(%rax)\n" ++
+                    "    movq %r12, 64(%rax)\n" ++
+                    "    movq %r13, 72(%rax)\n" ++
+                    "    movq %r14, 80(%rax)\n" ++
+                    "    movq %r15, 88(%rax)\n" ++
+                    "    addq $24, %rsp\n" ++
                     "    popq %r15\n" ++
                     "    popq %r14\n" ++
                     "    popq %r13\n" ++
                     "    popq %r12\n" ++
+                    "    popq %rbp\n" ++
                     "    popq %rbx\n" ++
+                    "    retq\n");
+        }
+
+        const sp_symbol = prefix ++ "zart_fiber_read_stack_pointer";
+        if (is_aarch64_aapcs64_basic) {
+            asm (".text\n" ++
+                    ".globl " ++ sp_symbol ++ "\n" ++
+                    sp_symbol ++ ":\n" ++
+                    "    mov x0, sp\n" ++
+                    "    ret\n");
+        } else if (is_x86_64_sysv) {
+            asm (".text\n" ++
+                    ".globl " ++ sp_symbol ++ "\n" ++
+                    sp_symbol ++ ":\n" ++
+                    "    movq %rsp, %rax\n" ++
                     "    retq\n");
         }
     }
@@ -793,6 +834,20 @@ comptime {
 
 fn yieldForRegisterProbe() callconv(.c) void {
     yield();
+}
+
+fn x86FpControlWithRounding(base: X86FpControl, mxcsr_rounding: u32, x87_rounding: u16) X86FpControl {
+    return .{
+        .mxcsr = (base.mxcsr & ~@as(u32, 0x6000)) | mxcsr_rounding,
+        .x87_cw = (base.x87_cw & ~@as(u16, 0x0c00)) | x87_rounding,
+        ._pad = 0,
+    };
+}
+
+fn expectEqualX86FpControl(expected: X86FpControl, actual: X86FpControl) !void {
+    const testing = std.testing;
+    try testing.expectEqual(expected.mxcsr & 0xffc0, actual.mxcsr & 0xffc0);
+    try testing.expectEqual(expected.x87_cw, actual.x87_cw);
 }
 
 test "basic run and yield" {
@@ -1085,6 +1140,7 @@ test "callee-saved general registers survive yield" {
                     0x2626_2626_2626_2626,
                     0x2727_2727_2727_2727,
                     0x2828_2828_2828_2828,
+                    0x2929_2929_2929_2929,
                     0xd8d8_d8d8_d8d8_d8d8,
                     0xd9d9_d9d9_d9d9_d9d9,
                     0xdada_dada_dada_dada,
@@ -1097,6 +1153,7 @@ test "callee-saved general registers survive yield" {
             else
                 .{
                     0x0b0b_0b0b_0b0b_0b0b,
+                    0x0b0b_0b0b_f0f0_f0f0,
                     0x1212_1212_1212_1212,
                     0x1313_1313_1313_1313,
                     0x1414_1414_1414_1414,
@@ -1112,4 +1169,68 @@ test "callee-saved general registers survive yield" {
     try testing.expectEqual(Status.suspended, try fiber.run());
     try testing.expectEqual(Status.completed, try fiber.run());
     try testing.expectEqualSlices(usize, &state.probe.expected, &state.probe.observed);
+}
+
+test "x86_64 SysV floating-point control state survives yield" {
+    if (comptime !is_x86_64_sysv) return error.SkipZigTest;
+
+    const original = captureX86FpControl();
+    defer setX86FpControl(original);
+
+    const caller_before_yield = x86FpControlWithRounding(original, 0x2000, 0x0400);
+    const fiber_expected = x86FpControlWithRounding(original, 0x6000, 0x0c00);
+    const caller_before_resume = x86FpControlWithRounding(original, 0x4000, 0x0800);
+
+    const S = struct {
+        target: X86FpControl,
+        after_resume: X86FpControl = .{},
+
+        fn run(arg: ?*anyopaque) anyerror!void {
+            const state: *@This() = @ptrCast(@alignCast(arg.?));
+            setX86FpControl(state.target);
+            yield();
+            state.after_resume = captureX86FpControl();
+        }
+    };
+
+    var state: S = .{ .target = fiber_expected };
+    var stack: [64 * 1024]u8 align(stack_alignment) = undefined;
+    var fiber: Fiber = undefined;
+    try init(&fiber, &stack, S.run, &state);
+    defer fiber.deinit();
+
+    setX86FpControl(caller_before_yield);
+    try std.testing.expectEqual(Status.suspended, try fiber.run());
+    try expectEqualX86FpControl(caller_before_yield, captureX86FpControl());
+
+    setX86FpControl(caller_before_resume);
+    try std.testing.expectEqual(Status.completed, try fiber.run());
+    try expectEqualX86FpControl(fiber_expected, state.after_resume);
+    try expectEqualX86FpControl(caller_before_resume, captureX86FpControl());
+}
+
+test "fiber stack pointer is ABI aligned at call boundaries" {
+    if (!supported) return error.SkipZigTest;
+
+    const S = struct {
+        sp: usize = 0,
+
+        fn run(arg: ?*anyopaque) anyerror!void {
+            const state: *@This() = @ptrCast(@alignCast(arg.?));
+            state.sp = zart_fiber_read_stack_pointer();
+        }
+    };
+
+    var state: S = .{};
+    var stack: [64 * 1024]u8 align(stack_alignment) = undefined;
+    var fiber: Fiber = undefined;
+    try init(&fiber, &stack, S.run, &state);
+    defer fiber.deinit();
+
+    try std.testing.expectEqual(Status.completed, try fiber.run());
+    if (comptime is_x86_64_sysv) {
+        try std.testing.expectEqual(@as(usize, 0), (state.sp + 8) % stack_alignment);
+    } else if (comptime is_aarch64_aapcs64_basic) {
+        try std.testing.expectEqual(@as(usize, 0), state.sp % stack_alignment);
+    }
 }
