@@ -81,6 +81,7 @@ pub const Status = enum {
     suspended,
     completed,
     failed,
+    abandoned,
 };
 
 pub const InitError = error{
@@ -93,6 +94,7 @@ pub const RunError = error{
     AlreadyRunning,
     Completed,
     Failed,
+    Abandoned,
 };
 
 pub const Entry = *const fn (arg: ?*anyopaque) anyerror!void;
@@ -117,7 +119,7 @@ prepared: bool,
 threadlocal var current_fiber: ?*Fiber = null;
 
 /// Initializes a fiber in-place. After this returns, the `Fiber` object must
-/// stay at the same address until `deinit` or `abandonWithoutUnwind`.
+/// stay at the same address until `deinit`.
 pub fn init(
     fiber: *Fiber,
     stack: []align(stack_alignment) u8,
@@ -150,6 +152,7 @@ pub fn run(fiber: *Fiber) RunError!Status {
         .running => return error.AlreadyRunning,
         .completed => return error.Completed,
         .failed => return error.Failed,
+        .abandoned => return error.Abandoned,
     }
 
     if (current_fiber == fiber) return error.AlreadyRunning;
@@ -204,7 +207,7 @@ pub fn failure(fiber: *const Fiber) ?anyerror {
 pub fn deinit(fiber: *Fiber) void {
     fiber.checkPinned();
     assert(current_fiber != fiber);
-    assert(fiber.state == .created or fiber.state == .completed or fiber.state == .failed);
+    assert(fiber.state == .created or fiber.state == .completed or fiber.state == .failed or fiber.state == .abandoned);
     fiber.debugInvalidate();
 }
 
@@ -217,7 +220,9 @@ pub fn abandonWithoutUnwind(fiber: *Fiber) void {
     fiber.checkPinned();
     assert(current_fiber != fiber);
     assert(fiber.state == .suspended);
-    fiber.debugInvalidate();
+    fiber.state = .abandoned;
+    fiber.resumer_context = null;
+    fiber.resumer_fiber = null;
 }
 
 fn debugInvalidate(fiber: *Fiber) void {
@@ -983,6 +988,10 @@ test "suspended fiber abandonment is explicit" {
 
     try std.testing.expectEqual(Status.suspended, try fiber.run());
     fiber.abandonWithoutUnwind();
+    defer fiber.deinit();
+
+    try std.testing.expectEqual(Status.abandoned, fiber.status());
+    try std.testing.expectError(error.Abandoned, fiber.run());
 }
 
 test "reentrant run of current fiber is rejected" {

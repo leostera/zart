@@ -472,6 +472,7 @@ pub const Runtime = struct {
         switch (status) {
             .created => unreachable,
             .running => unreachable,
+            .abandoned => unreachable,
             .suspended => switch (ready.loadState()) {
                 .running => {
                     ready.mustTransitionState(.running, .runnable);
@@ -1172,8 +1173,12 @@ fn StructActorCell(comptime Msg: type, comptime ActorType: type) type {
 
 fn deinitActorFiber(fiber: *Fiber) void {
     switch (fiber.status()) {
-        .suspended => fiber.abandonWithoutUnwind(),
-        else => fiber.deinit(),
+        .suspended => {
+            fiber.abandonWithoutUnwind();
+            fiber.deinit();
+        },
+        .created, .completed, .failed, .abandoned => fiber.deinit(),
+        .running => unreachable,
     }
 }
 
