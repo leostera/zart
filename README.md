@@ -23,6 +23,7 @@ Implemented today:
 - Runtime tracing hooks.
 - Stack slab pooling for actor fibers.
 - Explicit ABI-preserving fiber context switching on supported native targets.
+- Guard-page owning fiber stacks and opt-in stack high-water measurement.
 - Runnable examples under `examples/`.
 - Runtime tests and actor/fiber benchmarks.
 
@@ -32,7 +33,6 @@ Planned:
 - Lock-free SMP-ready mailboxes.
 - `spawn_blocking`.
 - Linux `io_uring` I/O backend.
-- Guard-page owning fiber stacks and stack high-water measurement.
 - Sanitizer/Valgrind fiber hooks.
 - WebAssembly backend via Asyncify/continuations.
 
@@ -168,25 +168,38 @@ Do not route blocking filesystem or network calls through `ctx.io()`. `spawn_blo
 
 ## Fibers
 
-Actors run on stackful fibers. `Fiber` is intentionally a low-level primitive: it owns no memory, so the caller supplies stack bytes and remains responsible for their lifetime.
+Actors run on stackful fibers. `Fiber` is intentionally a low-level primitive: the fast path accepts caller-provided stack bytes and does not allocate. `Fiber.init` initializes a fiber in-place, and the `Fiber` object must stay at a stable address until `deinit`. This pinning requirement does not prevent scheduler-thread migration; it only means the fiber handle itself cannot be copied or moved after initialization because the prepared stack stores its address.
 
 Supported native backends are explicit:
 
-- `x86_64_sysv`: Linux, macOS, BSD-family, DragonFly, Solaris.
+- `x86_64_sysv`: Linux, macOS, BSD-family, DragonFly.
 - `aarch64_aapcs64_basic`: Linux, macOS, BSD-family.
 
-The context switch saves the ABI-preserved register set directly in an `extern struct`, through global assembly with a C ABI boundary. On AArch64 the backend preserves `x19`-`x30`, `sp`, `pc`, and the low 64-bit lanes of `d8`-`d15`; optional SVE/SME state is not supported.
+The context switch saves ABI-preserved state directly in an `extern struct`, through global assembly with a C ABI boundary. On x86_64 SysV it preserves `rsp`, `rip`, `rbx`, `rbp`, `r12`-`r15`, MXCSR control state, and the x87 control word. On AArch64 it preserves `x19`-`x29`, `sp`, `pc`, the switch function's `lr`, and the low 64-bit lanes of `d8`-`d15`; optional SVE/SME state is not supported.
+
+For standalone fibers, prefer the guarded owning stack helper:
+
+```zig
+var stack = try zart.Fiber.Stack.alloc(64 * 1024);
+defer stack.deinit();
+
+var fiber: zart.Fiber = undefined;
+try stack.initFiber(&fiber, entry, arg); // also enables stackHighWaterMark()
+defer fiber.deinit();
+
+_ = try fiber.run();
+```
 
 Current Fiber limitations:
 
-- No guard-page owning stack helper yet; raw stack overflow corrupts memory.
+- Raw caller-provided stack slices have no guard page. Use `Fiber.Stack.alloc` when a standalone fiber should trap on downward stack overflow.
 - No ASan/TSan fiber annotations or Valgrind stack registration yet.
 - No reliable unwinding/backtraces across fiber boundaries.
-- No CET/shadow-stack integration on x86_64.
+- No CET shadow-stack integration on x86_64, and no explicit IBT/BTI/PAC landing-pad policy yet.
 - No C++ exception or `longjmp` crossing fiber boundaries.
 - No WebAssembly backend yet; Wasm needs an Asyncify/continuation backend, not native stack-pointer switching.
 
-`Fiber.deinit()` rejects suspended fibers. If a runtime intentionally discards a suspended stack without unwinding, it must call `abandonWithoutUnwind()` explicitly.
+`Fiber.deinit()` rejects suspended fibers. If a runtime intentionally discards a suspended stack without unwinding, it must call `abandonWithoutUnwind()` explicitly; this transitions the fiber to `.abandoned`, and later `run()` returns `error.Abandoned`.
 
 ## Tracing
 
