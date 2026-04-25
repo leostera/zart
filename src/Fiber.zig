@@ -7,10 +7,10 @@
 //! This primitive intentionally contains no scheduler. It only switches between
 //! the current execution context and a suspended fiber.
 //!
-//! Suspended fibers may be migrated between OS threads on supported targets, but
-//! concurrent calls to `run` on the same fiber are a scheduler bug. Zig
-//! thread-local storage remains OS-thread-local; a migrated fiber observes the
-//! thread-local values of the worker that runs it next.
+//! A suspended fiber may be resumed by another OS thread only when the scheduler
+//! provides external synchronization and fiber code does not keep thread-local
+//! references, OS-thread-affine resources, or platform TLS-derived pointers live
+//! across yield points.
 
 const Fiber = @This();
 
@@ -23,13 +23,22 @@ pub const minimum_stack_size: usize = 16 * 1024;
 pub const stack_grows_down = true;
 
 const native_os = builtin.os.tag;
-const x86_64_windows = builtin.cpu.arch == .x86_64 and native_os == .windows;
-const supported = switch (builtin.cpu.arch) {
-    .aarch64, .x86_64 => true,
+const is_x86_64_sysv = builtin.cpu.arch == .x86_64 and switch (native_os) {
+    .linux, .macos, .freebsd, .openbsd, .netbsd, .dragonfly, .solaris => true,
     else => false,
-} and !x86_64_windows;
+};
+const is_aarch64_aapcs64_basic = builtin.cpu.arch == .aarch64 and switch (native_os) {
+    .linux, .macos, .freebsd, .openbsd, .netbsd => true,
+    else => false,
+};
+const supported = is_x86_64_sysv or is_aarch64_aapcs64_basic;
 
-pub const supports_migration = supported;
+/// This fiber primitive does not preserve optional AArch64 SVE state.
+pub const supports_sve = false;
+/// This fiber primitive does not preserve optional AArch64 SME state.
+pub const supports_sme = false;
+pub const can_resume_on_different_thread_with_external_sync = supported;
+pub const supports_migration = can_resume_on_different_thread_with_external_sync;
 
 pub const Status = enum {
     created,
@@ -145,16 +154,22 @@ pub fn failure(fiber: *const Fiber) ?anyerror {
 pub fn deinit(fiber: *Fiber) void {
     assert(current_fiber != fiber);
     assert(fiber.state != .running);
-    fiber.* = undefined;
+    if (builtin.mode == .Debug) fiber.* = undefined;
 }
 
-pub fn stackUsed(fiber: *const Fiber) usize {
+/// Returns the distance from the top of the stack to the last saved stack
+/// pointer. While the fiber is running the saved stack pointer is stale.
+pub fn savedStackDepth(fiber: *const Fiber) usize {
     if (!fiber.prepared) return 0;
     const saved_sp = fiber.context.stackPointer();
     const stack_start = @intFromPtr(fiber.stack.ptr);
     const stack_end = stack_start + fiber.stack.len;
     if (saved_sp < stack_start or saved_sp > stack_end) return 0;
     return stack_end - saved_sp;
+}
+
+pub fn stackUsed(fiber: *const Fiber) usize {
+    return fiber.savedStackDepth();
 }
 
 fn prepare(fiber: *Fiber) void {
@@ -169,19 +184,49 @@ fn prepare(fiber: *Fiber) void {
     const frame: *EntryFrame = @ptrFromInt(frame_addr);
     frame.* = .{ .fiber = fiber };
 
-    fiber.context = switch (builtin.cpu.arch) {
-        .aarch64 => .{
+    if (comptime is_aarch64_aapcs64_basic) {
+        fiber.context = .{
             .sp = frame_addr,
-            .fp = 0,
             .pc = @intFromPtr(&fiberEntry),
-        },
-        .x86_64 => .{
-            .rsp = frame_addr - @sizeOf(usize),
-            .rbp = 0,
+            .x19 = 0,
+            .x20 = 0,
+            .x21 = 0,
+            .x22 = 0,
+            .x23 = 0,
+            .x24 = 0,
+            .x25 = 0,
+            .x26 = 0,
+            .x27 = 0,
+            .x28 = 0,
+            .fp = 0,
+            .lr = 0,
+            .d8 = 0,
+            .d9 = 0,
+            .d10 = 0,
+            .d11 = 0,
+            .d12 = 0,
+            .d13 = 0,
+            .d14 = 0,
+            .d15 = 0,
+        };
+    } else if (comptime is_x86_64_sysv) {
+        const ret_slot_addr = frame_addr - @sizeOf(usize);
+        assert(ret_slot_addr >= stack_start);
+        const ret_slot: *usize = @ptrFromInt(ret_slot_addr);
+        ret_slot.* = 0;
+
+        fiber.context = .{
+            .rsp = ret_slot_addr,
             .rip = @intFromPtr(&fiberEntry),
-        },
-        else => unreachable,
-    };
+            .rbx = 0,
+            .rbp = 0,
+            .r12 = 0,
+            .r13 = 0,
+            .r14 = 0,
+            .r15 = 0,
+        };
+    } else unreachable;
+
     fiber.prepared = true;
 }
 
@@ -210,38 +255,51 @@ fn finish(fiber: *Fiber) noreturn {
     unreachable;
 }
 
-fn fiberEntry() callconv(.naked) void {
-    switch (builtin.cpu.arch) {
-        .aarch64 => asm volatile (
+fn fiberEntry() callconv(.naked) noreturn {
+    if (comptime is_aarch64_aapcs64_basic) {
+        asm volatile (
             \\ ldr x0, [sp]
+            \\ mov x30, xzr
             \\ b %[entryTrampoline]
             :
             : [entryTrampoline] "X" (&entryTrampoline),
-        ),
-        .x86_64 => if (x86_64_windows) {
-            asm volatile (
-                \\ movq 8(%%rsp), %%rcx
-                \\ jmp %[entryTrampoline:P]
-                :
-                : [entryTrampoline] "X" (&entryTrampoline),
-            );
-        } else {
-            asm volatile (
-                \\ movq 8(%%rsp), %%rdi
-                \\ jmp %[entryTrampoline:P]
-                :
-                : [entryTrampoline] "X" (&entryTrampoline),
-            );
-        },
-        else => unreachable,
+        );
+    } else if (comptime is_x86_64_sysv) {
+        asm volatile (
+            \\ movq 8(%%rsp), %%rdi
+            \\ jmp %[entryTrampoline:P]
+            :
+            : [entryTrampoline] "X" (&entryTrampoline),
+        );
+    } else {
+        unreachable;
     }
 }
 
 const Context = if (supported) switch (builtin.cpu.arch) {
     .aarch64 => extern struct {
         sp: usize,
-        fp: usize,
         pc: usize,
+        x19: usize,
+        x20: usize,
+        x21: usize,
+        x22: usize,
+        x23: usize,
+        x24: usize,
+        x25: usize,
+        x26: usize,
+        x27: usize,
+        x28: usize,
+        fp: usize,
+        lr: usize,
+        d8: u64,
+        d9: u64,
+        d10: u64,
+        d11: u64,
+        d12: u64,
+        d13: u64,
+        d14: u64,
+        d15: u64,
 
         fn stackPointer(context: @This()) usize {
             return context.sp;
@@ -249,8 +307,13 @@ const Context = if (supported) switch (builtin.cpu.arch) {
     },
     .x86_64 => extern struct {
         rsp: usize,
-        rbp: usize,
         rip: usize,
+        rbx: usize,
+        rbp: usize,
+        r12: usize,
+        r13: usize,
+        r14: usize,
+        r15: usize,
 
         fn stackPointer(context: @This()) usize {
             return context.rsp;
@@ -263,180 +326,193 @@ const Context = if (supported) switch (builtin.cpu.arch) {
     }
 };
 
-noinline fn switchContext(prev: *Context, next: *Context) void {
-    switch (builtin.cpu.arch) {
-        .aarch64 => asm volatile (
-            \\ ldr x2, [x1, #16]
-            \\ mov x3, sp
-            \\ stp x3, fp, [x0]
-            \\ adr x4, 0f
-            \\ ldp x3, fp, [x1]
-            \\ str x4, [x0, #16]
-            \\ mov sp, x3
-            \\ br x2
-            \\0:
-            :
-            : [prev] "{x0}" (prev),
-              [next] "{x1}" (next),
-            : .{
-              .x0 = true,
-              .x1 = true,
-              .x2 = true,
-              .x3 = true,
-              .x4 = true,
-              .x5 = true,
-              .x6 = true,
-              .x7 = true,
-              .x8 = true,
-              .x9 = true,
-              .x10 = true,
-              .x11 = true,
-              .x12 = true,
-              .x13 = true,
-              .x14 = true,
-              .x15 = true,
-              .x16 = true,
-              .x17 = true,
-              .x19 = true,
-              .x20 = true,
-              .x21 = true,
-              .x22 = true,
-              .x23 = true,
-              .x24 = true,
-              .x25 = true,
-              .x26 = true,
-              .x27 = true,
-              .x28 = true,
-              .x30 = true,
-              .z0 = true,
-              .z1 = true,
-              .z2 = true,
-              .z3 = true,
-              .z4 = true,
-              .z5 = true,
-              .z6 = true,
-              .z7 = true,
-              .z8 = true,
-              .z9 = true,
-              .z10 = true,
-              .z11 = true,
-              .z12 = true,
-              .z13 = true,
-              .z14 = true,
-              .z15 = true,
-              .z16 = true,
-              .z17 = true,
-              .z18 = true,
-              .z19 = true,
-              .z20 = true,
-              .z21 = true,
-              .z22 = true,
-              .z23 = true,
-              .z24 = true,
-              .z25 = true,
-              .z26 = true,
-              .z27 = true,
-              .z28 = true,
-              .z29 = true,
-              .z30 = true,
-              .z31 = true,
-              .p0 = true,
-              .p1 = true,
-              .p2 = true,
-              .p3 = true,
-              .p4 = true,
-              .p5 = true,
-              .p6 = true,
-              .p7 = true,
-              .p8 = true,
-              .p9 = true,
-              .p10 = true,
-              .p11 = true,
-              .p12 = true,
-              .p13 = true,
-              .p14 = true,
-              .p15 = true,
-              .fpcr = true,
-              .fpsr = true,
-              .ffr = true,
-              .memory = true,
-            }),
-        .x86_64 => asm volatile (
-            \\ leaq 0f(%%rip), %%rax
-            \\ movq %%rsp, 0(%%rdi)
-            \\ movq %%rbp, 8(%%rdi)
-            \\ movq %%rax, 16(%%rdi)
-            \\ movq 0(%%rsi), %%rsp
-            \\ movq 8(%%rsi), %%rbp
-            \\ jmpq *16(%%rsi)
-            \\0:
-            :
-            : [prev] "{rdi}" (prev),
-              [next] "{rsi}" (next),
-            : .{
-              .rax = true,
-              .rcx = true,
-              .rdx = true,
-              .rbx = true,
-              .rsi = true,
-              .rdi = true,
-              .r8 = true,
-              .r9 = true,
-              .r10 = true,
-              .r11 = true,
-              .r12 = true,
-              .r13 = true,
-              .r14 = true,
-              .r15 = true,
-              .mm0 = true,
-              .mm1 = true,
-              .mm2 = true,
-              .mm3 = true,
-              .mm4 = true,
-              .mm5 = true,
-              .mm6 = true,
-              .mm7 = true,
-              .zmm0 = true,
-              .zmm1 = true,
-              .zmm2 = true,
-              .zmm3 = true,
-              .zmm4 = true,
-              .zmm5 = true,
-              .zmm6 = true,
-              .zmm7 = true,
-              .zmm8 = true,
-              .zmm9 = true,
-              .zmm10 = true,
-              .zmm11 = true,
-              .zmm12 = true,
-              .zmm13 = true,
-              .zmm14 = true,
-              .zmm15 = true,
-              .zmm16 = true,
-              .zmm17 = true,
-              .zmm18 = true,
-              .zmm19 = true,
-              .zmm20 = true,
-              .zmm21 = true,
-              .zmm22 = true,
-              .zmm23 = true,
-              .zmm24 = true,
-              .zmm25 = true,
-              .zmm26 = true,
-              .zmm27 = true,
-              .zmm28 = true,
-              .zmm29 = true,
-              .zmm30 = true,
-              .zmm31 = true,
-              .fpsr = true,
-              .fpcr = true,
-              .mxcsr = true,
-              .rflags = true,
-              .dirflag = true,
-              .memory = true,
-            }),
-        else => unreachable,
+extern fn zart_fiber_switch(prev: *Context, next: *const Context) callconv(.c) void;
+
+comptime {
+    if (supported) {
+        const prefix = if (builtin.object_format == .macho) "_" else "";
+        const symbol = prefix ++ "zart_fiber_switch";
+
+        if (is_aarch64_aapcs64_basic) {
+            asm (".text\n" ++
+                    ".globl " ++ symbol ++ "\n" ++
+                    symbol ++ ":\n" ++
+                    "    mov x9, sp\n" ++
+                    "    str x9, [x0, #0]\n" ++
+                    "    adr x9, 1f\n" ++
+                    "    str x9, [x0, #8]\n" ++
+                    "    stp x19, x20, [x0, #16]\n" ++
+                    "    stp x21, x22, [x0, #32]\n" ++
+                    "    stp x23, x24, [x0, #48]\n" ++
+                    "    stp x25, x26, [x0, #64]\n" ++
+                    "    stp x27, x28, [x0, #80]\n" ++
+                    "    stp x29, x30, [x0, #96]\n" ++
+                    "    stp d8, d9, [x0, #112]\n" ++
+                    "    stp d10, d11, [x0, #128]\n" ++
+                    "    stp d12, d13, [x0, #144]\n" ++
+                    "    stp d14, d15, [x0, #160]\n" ++
+                    "    ldr x9, [x1, #0]\n" ++
+                    "    ldr x10, [x1, #8]\n" ++
+                    "    ldp x19, x20, [x1, #16]\n" ++
+                    "    ldp x21, x22, [x1, #32]\n" ++
+                    "    ldp x23, x24, [x1, #48]\n" ++
+                    "    ldp x25, x26, [x1, #64]\n" ++
+                    "    ldp x27, x28, [x1, #80]\n" ++
+                    "    ldp x29, x30, [x1, #96]\n" ++
+                    "    ldp d8, d9, [x1, #112]\n" ++
+                    "    ldp d10, d11, [x1, #128]\n" ++
+                    "    ldp d12, d13, [x1, #144]\n" ++
+                    "    ldp d14, d15, [x1, #160]\n" ++
+                    "    mov sp, x9\n" ++
+                    "    br x10\n" ++
+                    "1:\n" ++
+                    "    ret\n");
+        } else if (is_x86_64_sysv) {
+            asm (".text\n" ++
+                    ".globl " ++ symbol ++ "\n" ++
+                    symbol ++ ":\n" ++
+                    "    leaq 1f(%rip), %rax\n" ++
+                    "    movq %rsp, 0(%rdi)\n" ++
+                    "    movq %rax, 8(%rdi)\n" ++
+                    "    movq %rbx, 16(%rdi)\n" ++
+                    "    movq %rbp, 24(%rdi)\n" ++
+                    "    movq %r12, 32(%rdi)\n" ++
+                    "    movq %r13, 40(%rdi)\n" ++
+                    "    movq %r14, 48(%rdi)\n" ++
+                    "    movq %r15, 56(%rdi)\n" ++
+                    "    movq 16(%rsi), %rbx\n" ++
+                    "    movq 24(%rsi), %rbp\n" ++
+                    "    movq 32(%rsi), %r12\n" ++
+                    "    movq 40(%rsi), %r13\n" ++
+                    "    movq 48(%rsi), %r14\n" ++
+                    "    movq 56(%rsi), %r15\n" ++
+                    "    movq 0(%rsi), %rsp\n" ++
+                    "    jmpq *8(%rsi)\n" ++
+                    "1:\n" ++
+                    "    retq\n");
+        }
     }
+}
+
+fn switchContext(prev: *Context, next: *const Context) void {
+    if (comptime supported) {
+        zart_fiber_switch(prev, next);
+    } else {
+        unreachable;
+    }
+}
+
+const preserved_register_test_count = if (is_aarch64_aapcs64_basic) 18 else if (is_x86_64_sysv) 5 else 0;
+
+const PreservedRegisterProbe = extern struct {
+    expected: [preserved_register_test_count]usize,
+    observed: [preserved_register_test_count]usize = undefined,
+};
+
+extern fn zart_fiber_probe_preserved_registers(
+    probe: *PreservedRegisterProbe,
+    yield_fn: *const fn () callconv(.c) void,
+) callconv(.c) void;
+
+comptime {
+    if (supported and builtin.is_test) {
+        const prefix = if (builtin.object_format == .macho) "_" else "";
+        const symbol = prefix ++ "zart_fiber_probe_preserved_registers";
+
+        if (is_aarch64_aapcs64_basic) {
+            asm (".text\n" ++
+                    ".globl " ++ symbol ++ "\n" ++
+                    symbol ++ ":\n" ++
+                    "    sub sp, sp, #192\n" ++
+                    "    stp x19, x20, [sp, #0]\n" ++
+                    "    stp x21, x22, [sp, #16]\n" ++
+                    "    stp x23, x24, [sp, #32]\n" ++
+                    "    stp x25, x26, [sp, #48]\n" ++
+                    "    stp x27, x28, [sp, #64]\n" ++
+                    "    stp x29, x30, [sp, #80]\n" ++
+                    "    str x0, [sp, #96]\n" ++
+                    "    stp d8, d9, [sp, #112]\n" ++
+                    "    stp d10, d11, [sp, #128]\n" ++
+                    "    stp d12, d13, [sp, #144]\n" ++
+                    "    stp d14, d15, [sp, #160]\n" ++
+                    "    ldr x19, [x0, #0]\n" ++
+                    "    ldr x20, [x0, #8]\n" ++
+                    "    ldr x21, [x0, #16]\n" ++
+                    "    ldr x22, [x0, #24]\n" ++
+                    "    ldr x23, [x0, #32]\n" ++
+                    "    ldr x24, [x0, #40]\n" ++
+                    "    ldr x25, [x0, #48]\n" ++
+                    "    ldr x26, [x0, #56]\n" ++
+                    "    ldr x27, [x0, #64]\n" ++
+                    "    ldr x28, [x0, #72]\n" ++
+                    "    ldp d8, d9, [x0, #80]\n" ++
+                    "    ldp d10, d11, [x0, #96]\n" ++
+                    "    ldp d12, d13, [x0, #112]\n" ++
+                    "    ldp d14, d15, [x0, #128]\n" ++
+                    "    blr x1\n" ++
+                    "    ldr x9, [sp, #96]\n" ++
+                    "    str x19, [x9, #144]\n" ++
+                    "    str x20, [x9, #152]\n" ++
+                    "    str x21, [x9, #160]\n" ++
+                    "    str x22, [x9, #168]\n" ++
+                    "    str x23, [x9, #176]\n" ++
+                    "    str x24, [x9, #184]\n" ++
+                    "    str x25, [x9, #192]\n" ++
+                    "    str x26, [x9, #200]\n" ++
+                    "    str x27, [x9, #208]\n" ++
+                    "    str x28, [x9, #216]\n" ++
+                    "    stp d8, d9, [x9, #224]\n" ++
+                    "    stp d10, d11, [x9, #240]\n" ++
+                    "    stp d12, d13, [x9, #256]\n" ++
+                    "    stp d14, d15, [x9, #272]\n" ++
+                    "    ldp x19, x20, [sp, #0]\n" ++
+                    "    ldp x21, x22, [sp, #16]\n" ++
+                    "    ldp x23, x24, [sp, #32]\n" ++
+                    "    ldp x25, x26, [sp, #48]\n" ++
+                    "    ldp x27, x28, [sp, #64]\n" ++
+                    "    ldp x29, x30, [sp, #80]\n" ++
+                    "    ldp d8, d9, [sp, #112]\n" ++
+                    "    ldp d10, d11, [sp, #128]\n" ++
+                    "    ldp d12, d13, [sp, #144]\n" ++
+                    "    ldp d14, d15, [sp, #160]\n" ++
+                    "    add sp, sp, #192\n" ++
+                    "    ret\n");
+        } else if (is_x86_64_sysv) {
+            asm (".text\n" ++
+                    ".globl " ++ symbol ++ "\n" ++
+                    symbol ++ ":\n" ++
+                    "    pushq %rbx\n" ++
+                    "    pushq %r12\n" ++
+                    "    pushq %r13\n" ++
+                    "    pushq %r14\n" ++
+                    "    pushq %r15\n" ++
+                    "    subq $16, %rsp\n" ++
+                    "    movq %rdi, 0(%rsp)\n" ++
+                    "    movq 0(%rdi), %rbx\n" ++
+                    "    movq 8(%rdi), %r12\n" ++
+                    "    movq 16(%rdi), %r13\n" ++
+                    "    movq 24(%rdi), %r14\n" ++
+                    "    movq 32(%rdi), %r15\n" ++
+                    "    callq *%rsi\n" ++
+                    "    movq 0(%rsp), %rax\n" ++
+                    "    movq %rbx, 40(%rax)\n" ++
+                    "    movq %r12, 48(%rax)\n" ++
+                    "    movq %r13, 56(%rax)\n" ++
+                    "    movq %r14, 64(%rax)\n" ++
+                    "    movq %r15, 72(%rax)\n" ++
+                    "    addq $16, %rsp\n" ++
+                    "    popq %r15\n" ++
+                    "    popq %r14\n" ++
+                    "    popq %r13\n" ++
+                    "    popq %r12\n" ++
+                    "    popq %rbx\n" ++
+                    "    retq\n");
+        }
+    }
+}
+
+fn yieldForRegisterProbe() callconv(.c) void {
+    yield();
 }
 
 test "basic run and yield" {
@@ -514,4 +590,196 @@ test "defers run when entry returns" {
     try testing.expectEqual(@as(u32, 1), value);
     try testing.expectEqual(Status.completed, try fiber.run());
     try testing.expectEqual(@as(u32, 3), value);
+}
+
+test "multiple yields preserve control flow" {
+    if (!supported) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const S = struct {
+        fn run(arg: ?*anyopaque) anyerror!void {
+            const value: *usize = @ptrCast(@alignCast(arg.?));
+            for (0..5) |index| {
+                value.* = index + 1;
+                yield();
+            }
+        }
+    };
+
+    var stack: [64 * 1024]u8 align(stack_alignment) = undefined;
+    var value: usize = 0;
+    var fiber = try init(&stack, S.run, &value);
+    defer fiber.deinit();
+
+    for (0..5) |index| {
+        try testing.expectEqual(Status.suspended, try fiber.run());
+        try testing.expectEqual(index + 1, value);
+        try testing.expect(fiber.savedStackDepth() > 0);
+    }
+    try testing.expectEqual(Status.completed, try fiber.run());
+}
+
+test "nested fibers resume their direct resumer" {
+    if (!supported) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const Child = struct {
+        fn run(arg: ?*anyopaque) anyerror!void {
+            const log: *std.ArrayListUnmanaged(u8) = @ptrCast(@alignCast(arg.?));
+            try log.append(testing.allocator, 'b');
+            yield();
+            try log.append(testing.allocator, 'd');
+        }
+    };
+    const ParentState = struct {
+        child: *Fiber,
+        log: *std.ArrayListUnmanaged(u8),
+
+        fn run(arg: ?*anyopaque) anyerror!void {
+            const state: *@This() = @ptrCast(@alignCast(arg.?));
+            try state.log.append(testing.allocator, 'a');
+            try testing.expectEqual(Status.suspended, try state.child.run());
+            try state.log.append(testing.allocator, 'c');
+            yield();
+            try testing.expectEqual(Status.completed, try state.child.run());
+            try state.log.append(testing.allocator, 'e');
+        }
+    };
+
+    var log: std.ArrayListUnmanaged(u8) = .empty;
+    defer log.deinit(testing.allocator);
+
+    var child_stack: [64 * 1024]u8 align(stack_alignment) = undefined;
+    var child = try init(&child_stack, Child.run, &log);
+    defer child.deinit();
+
+    var parent_stack: [64 * 1024]u8 align(stack_alignment) = undefined;
+    var parent_state: ParentState = .{ .child = &child, .log = &log };
+    var parent = try init(&parent_stack, ParentState.run, &parent_state);
+    defer parent.deinit();
+
+    try testing.expectEqual(Status.suspended, try parent.run());
+    try testing.expectEqualStrings("abc", log.items);
+    try testing.expectEqual(Status.completed, try parent.run());
+    try testing.expectEqualStrings("abcde", log.items);
+}
+
+test "entry error after yield is observable" {
+    if (!supported) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const Expected = error{Expected};
+    const S = struct {
+        fn run(_: ?*anyopaque) anyerror!void {
+            yield();
+            return Expected.Expected;
+        }
+    };
+
+    var stack: [64 * 1024]u8 align(stack_alignment) = undefined;
+    var fiber = try init(&stack, S.run, null);
+    defer fiber.deinit();
+
+    try testing.expectEqual(Status.suspended, try fiber.run());
+    try testing.expectEqual(Status.failed, try fiber.run());
+    try testing.expectEqual(Expected.Expected, fiber.failure().?);
+    try testing.expectError(error.Failed, fiber.run());
+}
+
+test "reentrant run of current fiber is rejected" {
+    if (!supported) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const S = struct {
+        fn run(arg: ?*anyopaque) anyerror!void {
+            const observed: *bool = @ptrCast(@alignCast(arg.?));
+            const self = current().?;
+            try testing.expectError(error.AlreadyRunning, self.run());
+            observed.* = true;
+        }
+    };
+
+    var stack: [64 * 1024]u8 align(stack_alignment) = undefined;
+    var observed = false;
+    var fiber = try init(&stack, S.run, &observed);
+    defer fiber.deinit();
+
+    try testing.expectEqual(Status.completed, try fiber.run());
+    try testing.expect(observed);
+}
+
+test "stack size boundaries are enforced" {
+    if (!supported) return error.SkipZigTest;
+
+    const testing = std.testing;
+
+    var too_small: [minimum_stack_size - stack_alignment]u8 align(stack_alignment) = undefined;
+    try testing.expectError(error.StackTooSmall, init(&too_small, struct {
+        fn run(_: ?*anyopaque) anyerror!void {}
+    }.run, null));
+
+    var boundary: [minimum_stack_size]u8 align(stack_alignment) = undefined;
+    var fiber = try init(&boundary, struct {
+        fn run(_: ?*anyopaque) anyerror!void {}
+    }.run, null);
+    defer fiber.deinit();
+
+    try testing.expectEqual(@as(usize, 0), fiber.savedStackDepth());
+    try testing.expectEqual(Status.completed, try fiber.run());
+    try testing.expect(fiber.savedStackDepth() > 0);
+}
+
+test "callee-saved general registers survive yield" {
+    if (!supported) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const S = struct {
+        probe: PreservedRegisterProbe,
+
+        fn run(arg: ?*anyopaque) anyerror!void {
+            const state: *@This() = @ptrCast(@alignCast(arg.?));
+            zart_fiber_probe_preserved_registers(&state.probe, yieldForRegisterProbe);
+        }
+    };
+
+    var state: S = .{
+        .probe = .{
+            .expected = if (comptime is_aarch64_aapcs64_basic)
+                .{
+                    0x1919_1919_1919_1919,
+                    0x2020_2020_2020_2020,
+                    0x2121_2121_2121_2121,
+                    0x2222_2222_2222_2222,
+                    0x2323_2323_2323_2323,
+                    0x2424_2424_2424_2424,
+                    0x2525_2525_2525_2525,
+                    0x2626_2626_2626_2626,
+                    0x2727_2727_2727_2727,
+                    0x2828_2828_2828_2828,
+                    0xd8d8_d8d8_d8d8_d8d8,
+                    0xd9d9_d9d9_d9d9_d9d9,
+                    0xdada_dada_dada_dada,
+                    0xdbdb_dbdb_dbdb_dbdb,
+                    0xdcdc_dcdc_dcdc_dcdc,
+                    0xdddd_dddd_dddd_dddd,
+                    0xdede_dede_dede_dede,
+                    0xdfdf_dfdf_dfdf_dfdf,
+                }
+            else
+                .{
+                    0x0b0b_0b0b_0b0b_0b0b,
+                    0x1212_1212_1212_1212,
+                    0x1313_1313_1313_1313,
+                    0x1414_1414_1414_1414,
+                    0x1515_1515_1515_1515,
+                },
+        },
+    };
+    var stack: [64 * 1024]u8 align(stack_alignment) = undefined;
+    var fiber = try init(&stack, S.run, &state);
+    defer fiber.deinit();
+
+    try testing.expectEqual(Status.suspended, try fiber.run());
+    try testing.expectEqual(Status.completed, try fiber.run());
+    try testing.expectEqualSlices(usize, &state.probe.expected, &state.probe.observed);
 }
