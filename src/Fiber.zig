@@ -18,6 +18,14 @@ const builtin = @import("builtin");
 const std = @import("std");
 const assert = std.debug.assert;
 
+fn expectOffset(comptime T: type, comptime field: []const u8, comptime expected: usize) void {
+    if (@offsetOf(T, field) != expected) @compileError("fiber assembly layout offset changed");
+}
+
+fn expectSize(comptime T: type, comptime expected: usize) void {
+    if (@sizeOf(T) != expected) @compileError("fiber assembly layout size changed");
+}
+
 pub const stack_alignment: comptime_int = 16;
 pub const minimum_stack_size: usize = 16 * 1024;
 pub const stack_grows_down = true;
@@ -178,6 +186,23 @@ fn prepare(fiber: *Fiber) void {
 
     const stack_start = @intFromPtr(fiber.stack.ptr);
     const stack_end = stack_start + fiber.stack.len;
+
+    // Fiber stacks grow downward on both currently supported ABIs. The initial
+    // stack contains only an `EntryFrame`, which gives the naked entry stub the
+    // `Fiber` pointer it must pass to `entryTrampoline`.
+    //
+    // AArch64 entry layout:
+    //
+    //   sp -> EntryFrame{ .fiber = fiber }
+    //
+    // x86_64 SysV entry layout:
+    //
+    //   rsp + 0 -> zero fake return address
+    //   rsp + 8 -> EntryFrame{ .fiber = fiber }
+    //
+    // x86_64 gets a fake return slot because normal SysV functions are entered
+    // by `call`, and therefore see a return address at `(%rsp)`. We enter via
+    // `jmp`, so the slot is a deliberate sentinel instead of stack garbage.
     const frame_addr = std.mem.alignBackward(usize, stack_end - @sizeOf(EntryFrame), stack_alignment);
     assert(frame_addr >= stack_start);
 
@@ -255,6 +280,18 @@ fn finish(fiber: *Fiber) noreturn {
     unreachable;
 }
 
+// First instruction executed on a freshly prepared fiber stack. This is naked
+// because there is no caller-created frame yet; any compiler prologue would use
+// a stack/register state that only our assembly has defined.
+//
+// The stub does exactly one ABI-specific argument move and then tail-jumps into
+// normal Zig code:
+//
+// - AArch64 AAPCS64 passes the first argument in `x0`. `sp` points directly at
+//   `EntryFrame`, so `[sp]` is the stored `Fiber *`. `x30` is cleared so an
+//   accidental return from the trampoline traps instead of jumping to garbage.
+// - x86_64 SysV passes the first argument in `rdi`. `(%rsp)` is the fake return
+//   address, so `8(%rsp)` is the stored `Fiber *`.
 fn fiberEntry() callconv(.naked) noreturn {
     if (comptime is_aarch64_aapcs64_basic) {
         asm volatile (
@@ -278,6 +315,14 @@ fn fiberEntry() callconv(.naked) noreturn {
 
 const Context = if (supported) switch (builtin.cpu.arch) {
     .aarch64 => extern struct {
+        // Offsets are part of the hand-written assembly contract:
+        //   0: sp, 8: pc, 16..88: x19..x28, 96: fp/x29, 104: lr/x30,
+        //   112..168: low 64-bit lanes of d8..d15.
+        //
+        // AAPCS64 requires x19-x29 and SP to be preserved across calls. The
+        // low 64 bits of v8-v15 are also preserved; storing `d8`-`d15` captures
+        // exactly that required part. Optional SVE/SME state is intentionally
+        // not supported by this primitive.
         sp: usize,
         pc: usize,
         x19: usize,
@@ -306,6 +351,11 @@ const Context = if (supported) switch (builtin.cpu.arch) {
         }
     },
     .x86_64 => extern struct {
+        // Offsets are part of the hand-written assembly contract:
+        //   0: rsp, 8: rip, 16: rbx, 24: rbp, 32..56: r12..r15.
+        //
+        // Under the SysV ABI these GPRs are callee-saved. Vector/MMX/XMM state
+        // is caller-saved under SysV, so it is not stored in the fiber context.
         rsp: usize,
         rip: usize,
         rbx: usize,
@@ -326,14 +376,67 @@ const Context = if (supported) switch (builtin.cpu.arch) {
     }
 };
 
+fn verifyContextLayout() void {
+    if (comptime is_aarch64_aapcs64_basic) {
+        expectOffset(Context, "sp", 0);
+        expectOffset(Context, "pc", 8);
+        expectOffset(Context, "x19", 16);
+        expectOffset(Context, "x20", 24);
+        expectOffset(Context, "x21", 32);
+        expectOffset(Context, "x22", 40);
+        expectOffset(Context, "x23", 48);
+        expectOffset(Context, "x24", 56);
+        expectOffset(Context, "x25", 64);
+        expectOffset(Context, "x26", 72);
+        expectOffset(Context, "x27", 80);
+        expectOffset(Context, "x28", 88);
+        expectOffset(Context, "fp", 96);
+        expectOffset(Context, "lr", 104);
+        expectOffset(Context, "d8", 112);
+        expectOffset(Context, "d9", 120);
+        expectOffset(Context, "d10", 128);
+        expectOffset(Context, "d11", 136);
+        expectOffset(Context, "d12", 144);
+        expectOffset(Context, "d13", 152);
+        expectOffset(Context, "d14", 160);
+        expectOffset(Context, "d15", 168);
+        expectSize(Context, 176);
+    } else if (comptime is_x86_64_sysv) {
+        expectOffset(Context, "rsp", 0);
+        expectOffset(Context, "rip", 8);
+        expectOffset(Context, "rbx", 16);
+        expectOffset(Context, "rbp", 24);
+        expectOffset(Context, "r12", 32);
+        expectOffset(Context, "r13", 40);
+        expectOffset(Context, "r14", 48);
+        expectOffset(Context, "r15", 56);
+        expectSize(Context, 64);
+    }
+}
+
 extern fn zart_fiber_switch(prev: *Context, next: *const Context) callconv(.c) void;
 
 comptime {
     if (supported) {
+        verifyContextLayout();
+
         const prefix = if (builtin.object_format == .macho) "_" else "";
         const symbol = prefix ++ "zart_fiber_switch";
 
         if (is_aarch64_aapcs64_basic) {
+            // C ABI arguments:
+            //   x0 = prev context
+            //   x1 = next context
+            //
+            // Save the current continuation into `prev`:
+            //   sp is the current stack pointer.
+            //   pc is the local resume label `1`.
+            //   x19-x30 and d8-d15 are the AAPCS64 preserved register set.
+            //
+            // Restore `next` in the opposite order, install its stack pointer,
+            // and branch to its saved pc. When this saved context is resumed in
+            // the future, execution continues at label `1` and `ret` returns to
+            // the original caller of `zart_fiber_switch`.
             asm (".text\n" ++
                     ".globl " ++ symbol ++ "\n" ++
                     symbol ++ ":\n" ++
@@ -368,6 +471,18 @@ comptime {
                     "1:\n" ++
                     "    ret\n");
         } else if (is_x86_64_sysv) {
+            // C ABI arguments:
+            //   rdi = prev context
+            //   rsi = next context
+            //
+            // Save the current continuation into `prev`:
+            //   rsp is the current stack pointer.
+            //   rip is the local resume label `1`.
+            //   rbx/rbp/r12-r15 are the SysV callee-saved GPRs.
+            //
+            // Restore `next`, switch stacks, and jump to its saved rip. When
+            // this saved context is resumed later, label `1` executes `retq`,
+            // returning to the original caller of `zart_fiber_switch`.
             asm (".text\n" ++
                     ".globl " ++ symbol ++ "\n" ++
                     symbol ++ ":\n" ++
@@ -405,9 +520,25 @@ fn switchContext(prev: *Context, next: *const Context) void {
 const preserved_register_test_count = if (is_aarch64_aapcs64_basic) 18 else if (is_x86_64_sysv) 5 else 0;
 
 const PreservedRegisterProbe = extern struct {
+    // Test-only assembly treats this as two adjacent arrays. `observed` starts
+    // immediately after `expected`, so the observed offset is:
+    //   AArch64: 18 registers * 8 bytes = 144
+    //   x86_64:  5 registers * 8 bytes = 40
     expected: [preserved_register_test_count]usize,
     observed: [preserved_register_test_count]usize = undefined,
 };
+
+fn verifyPreservedRegisterProbeLayout() void {
+    if (comptime is_aarch64_aapcs64_basic) {
+        expectOffset(PreservedRegisterProbe, "expected", 0);
+        expectOffset(PreservedRegisterProbe, "observed", 144);
+        expectSize(PreservedRegisterProbe, 288);
+    } else if (comptime is_x86_64_sysv) {
+        expectOffset(PreservedRegisterProbe, "expected", 0);
+        expectOffset(PreservedRegisterProbe, "observed", 40);
+        expectSize(PreservedRegisterProbe, 80);
+    }
+}
 
 extern fn zart_fiber_probe_preserved_registers(
     probe: *PreservedRegisterProbe,
@@ -416,10 +547,27 @@ extern fn zart_fiber_probe_preserved_registers(
 
 comptime {
     if (supported and builtin.is_test) {
+        verifyPreservedRegisterProbeLayout();
+
         const prefix = if (builtin.object_format == .macho) "_" else "";
         const symbol = prefix ++ "zart_fiber_probe_preserved_registers";
 
         if (is_aarch64_aapcs64_basic) {
+            // Test-only register preservation probe.
+            //
+            // C ABI arguments:
+            //   x0 = PreservedRegisterProbe *
+            //   x1 = C-callable yield function
+            //
+            // Local stack frame:
+            //   0..95    original x19-x30, restored before returning
+            //   96       saved probe pointer, because x0 is caller-saved
+            //   112..175 original d8-d15, restored before returning
+            //   176..191 padding to keep `sp` 16-byte aligned
+            //
+            // The probe loads expected values into the preserved registers,
+            // calls `Fiber.yield`, records the registers after resume, then
+            // restores its caller's preserved registers before returning.
             asm (".text\n" ++
                     ".globl " ++ symbol ++ "\n" ++
                     symbol ++ ":\n" ++
@@ -478,6 +626,15 @@ comptime {
                     "    add sp, sp, #192\n" ++
                     "    ret\n");
         } else if (is_x86_64_sysv) {
+            // Test-only register preservation probe.
+            //
+            // C ABI arguments:
+            //   rdi = PreservedRegisterProbe *
+            //   rsi = C-callable yield function
+            //
+            // The five pushes preserve the caller's SysV callee-saved GPRs.
+            // The extra 16-byte allocation keeps `%rsp` 16-byte aligned before
+            // `callq *%rsi` and provides a spill slot for the probe pointer.
             asm (".text\n" ++
                     ".globl " ++ symbol ++ "\n" ++
                     symbol ++ ":\n" ++
