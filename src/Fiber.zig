@@ -104,6 +104,7 @@ const X86FpControl = extern struct {
 };
 
 context: Context = undefined,
+self: *Fiber,
 stack: []align(stack_alignment) u8,
 entry: Entry,
 arg: ?*anyopaque,
@@ -115,15 +116,19 @@ prepared: bool,
 
 threadlocal var current_fiber: ?*Fiber = null;
 
+/// Initializes a fiber in-place. After this returns, the `Fiber` object must
+/// stay at the same address until `deinit` or `abandonWithoutUnwind`.
 pub fn init(
+    fiber: *Fiber,
     stack: []align(stack_alignment) u8,
     entry: Entry,
     arg: ?*anyopaque,
-) InitError!Fiber {
+) InitError!void {
     if (!supported) return error.Unsupported;
     if (stack.len < minimum_stack_size) return error.StackTooSmall;
 
-    return .{
+    fiber.* = .{
+        .self = fiber,
         .stack = stack,
         .entry = entry,
         .arg = arg,
@@ -138,6 +143,7 @@ pub fn init(
 /// Runs the fiber until it yields, completes, or fails.
 pub fn run(fiber: *Fiber) RunError!Status {
     if (!supported) return error.Unsupported;
+    fiber.checkPinned();
 
     switch (fiber.state) {
         .created, .suspended => {},
@@ -171,6 +177,7 @@ pub fn run(fiber: *Fiber) RunError!Status {
 /// fiber's normal control flow later exits their scopes.
 pub fn yield() void {
     const fiber = current_fiber orelse @panic("Fiber.yield called outside of a fiber");
+    fiber.checkPinned();
     assert(fiber.state == .running);
     const resumer_context = fiber.resumer_context orelse @panic("fiber has no resumer");
 
@@ -185,14 +192,17 @@ pub fn current() ?*Fiber {
 }
 
 pub fn status(fiber: *const Fiber) Status {
+    fiber.checkPinned();
     return fiber.state;
 }
 
 pub fn failure(fiber: *const Fiber) ?anyerror {
+    fiber.checkPinned();
     return fiber.failure_error;
 }
 
 pub fn deinit(fiber: *Fiber) void {
+    fiber.checkPinned();
     assert(current_fiber != fiber);
     assert(fiber.state == .created or fiber.state == .completed or fiber.state == .failed);
     fiber.debugInvalidate();
@@ -204,6 +214,7 @@ pub fn deinit(fiber: *Fiber) void {
 /// release locks, or clean up borrowed state held by the suspended call stack.
 /// Only use this when the owner can prove abandoning that stack is safe.
 pub fn abandonWithoutUnwind(fiber: *Fiber) void {
+    fiber.checkPinned();
     assert(current_fiber != fiber);
     assert(fiber.state == .suspended);
     fiber.debugInvalidate();
@@ -213,9 +224,16 @@ fn debugInvalidate(fiber: *Fiber) void {
     if (builtin.mode == .Debug) fiber.* = undefined;
 }
 
+fn checkPinned(fiber: *const Fiber) void {
+    if (@intFromPtr(fiber.self) != @intFromPtr(fiber)) {
+        @panic("Fiber object was moved or copied after initialization");
+    }
+}
+
 /// Returns the distance from the top of the stack to the last saved stack
 /// pointer. While the fiber is running the saved stack pointer is stale.
 pub fn savedStackDepth(fiber: *const Fiber) usize {
+    fiber.checkPinned();
     if (!fiber.prepared) return 0;
     const saved_sp = fiber.context.stackPointer();
     const stack_start = @intFromPtr(fiber.stack.ptr);
@@ -790,7 +808,8 @@ test "basic run and yield" {
 
     var stack: [64 * 1024]u8 align(stack_alignment) = undefined;
     var state: ContextState = .{};
-    var fiber = try init(&stack, ContextState.run, &state);
+    var fiber: Fiber = undefined;
+    try init(&fiber, &stack, ContextState.run, &state);
     defer fiber.deinit();
 
     try testing.expectEqual(Status.created, fiber.status());
@@ -816,7 +835,8 @@ test "entry error is observable" {
     };
 
     var stack: [64 * 1024]u8 align(stack_alignment) = undefined;
-    var fiber = try init(&stack, S.run, null);
+    var fiber: Fiber = undefined;
+    try init(&fiber, &stack, S.run, null);
     defer fiber.deinit();
 
     try testing.expectEqual(Status.failed, try fiber.run());
@@ -840,7 +860,8 @@ test "defers run when entry returns" {
 
     var stack: [64 * 1024]u8 align(stack_alignment) = undefined;
     var value: u32 = 0;
-    var fiber = try init(&stack, S.run, &value);
+    var fiber: Fiber = undefined;
+    try init(&fiber, &stack, S.run, &value);
     defer fiber.deinit();
 
     try testing.expectEqual(Status.suspended, try fiber.run());
@@ -865,7 +886,8 @@ test "multiple yields preserve control flow" {
 
     var stack: [64 * 1024]u8 align(stack_alignment) = undefined;
     var value: usize = 0;
-    var fiber = try init(&stack, S.run, &value);
+    var fiber: Fiber = undefined;
+    try init(&fiber, &stack, S.run, &value);
     defer fiber.deinit();
 
     for (0..5) |index| {
@@ -907,12 +929,14 @@ test "nested fibers resume their direct resumer" {
     defer log.deinit(testing.allocator);
 
     var child_stack: [64 * 1024]u8 align(stack_alignment) = undefined;
-    var child = try init(&child_stack, Child.run, &log);
+    var child: Fiber = undefined;
+    try init(&child, &child_stack, Child.run, &log);
     defer child.deinit();
 
     var parent_stack: [64 * 1024]u8 align(stack_alignment) = undefined;
     var parent_state: ParentState = .{ .child = &child, .log = &log };
-    var parent = try init(&parent_stack, ParentState.run, &parent_state);
+    var parent: Fiber = undefined;
+    try init(&parent, &parent_stack, ParentState.run, &parent_state);
     defer parent.deinit();
 
     try testing.expectEqual(Status.suspended, try parent.run());
@@ -934,7 +958,8 @@ test "entry error after yield is observable" {
     };
 
     var stack: [64 * 1024]u8 align(stack_alignment) = undefined;
-    var fiber = try init(&stack, S.run, null);
+    var fiber: Fiber = undefined;
+    try init(&fiber, &stack, S.run, null);
     defer fiber.deinit();
 
     try testing.expectEqual(Status.suspended, try fiber.run());
@@ -953,7 +978,8 @@ test "suspended fiber abandonment is explicit" {
     };
 
     var stack: [64 * 1024]u8 align(stack_alignment) = undefined;
-    var fiber = try init(&stack, S.run, null);
+    var fiber: Fiber = undefined;
+    try init(&fiber, &stack, S.run, null);
 
     try std.testing.expectEqual(Status.suspended, try fiber.run());
     fiber.abandonWithoutUnwind();
@@ -974,7 +1000,8 @@ test "reentrant run of current fiber is rejected" {
 
     var stack: [64 * 1024]u8 align(stack_alignment) = undefined;
     var observed = false;
-    var fiber = try init(&stack, S.run, &observed);
+    var fiber: Fiber = undefined;
+    try init(&fiber, &stack, S.run, &observed);
     defer fiber.deinit();
 
     try testing.expectEqual(Status.completed, try fiber.run());
@@ -987,12 +1014,14 @@ test "stack size boundaries are enforced" {
     const testing = std.testing;
 
     var too_small: [minimum_stack_size - stack_alignment]u8 align(stack_alignment) = undefined;
-    try testing.expectError(error.StackTooSmall, init(&too_small, struct {
+    var rejected: Fiber = undefined;
+    try testing.expectError(error.StackTooSmall, init(&rejected, &too_small, struct {
         fn run(_: ?*anyopaque) anyerror!void {}
     }.run, null));
 
     var boundary: [minimum_stack_size]u8 align(stack_alignment) = undefined;
-    var fiber = try init(&boundary, struct {
+    var fiber: Fiber = undefined;
+    try init(&fiber, &boundary, struct {
         fn run(_: ?*anyopaque) anyerror!void {}
     }.run, null);
     defer fiber.deinit();
@@ -1000,6 +1029,24 @@ test "stack size boundaries are enforced" {
     try testing.expectEqual(@as(usize, 0), fiber.savedStackDepth());
     try testing.expectEqual(Status.completed, try fiber.run());
     try testing.expect(fiber.savedStackDepth() > 0);
+}
+
+test "fiber records its pinned address" {
+    if (!supported) return error.SkipZigTest;
+
+    const testing = std.testing;
+
+    var stack: [minimum_stack_size]u8 align(stack_alignment) = undefined;
+    var fiber: Fiber = undefined;
+    try init(&fiber, &stack, struct {
+        fn run(_: ?*anyopaque) anyerror!void {}
+    }.run, null);
+    defer fiber.deinit();
+
+    try testing.expectEqual(@intFromPtr(&fiber), @intFromPtr(fiber.self));
+
+    const copied = fiber;
+    try testing.expect(@intFromPtr(&copied) != @intFromPtr(copied.self));
 }
 
 test "callee-saved general registers survive yield" {
@@ -1049,7 +1096,8 @@ test "callee-saved general registers survive yield" {
         },
     };
     var stack: [64 * 1024]u8 align(stack_alignment) = undefined;
-    var fiber = try init(&stack, S.run, &state);
+    var fiber: Fiber = undefined;
+    try init(&fiber, &stack, S.run, &state);
     defer fiber.deinit();
 
     try testing.expectEqual(Status.suspended, try fiber.run());

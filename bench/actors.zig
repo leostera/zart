@@ -618,7 +618,7 @@ fn measureFiberInit(reporter: Reporter, options: Options, fiber_count: usize) !i
     const start = nowNs(reporter.io);
     for (fibers, 0..) |*fiber, index| {
         const stack = stacks[index * options.stack_size ..][0..options.stack_size];
-        fiber.* = try zart.Fiber.init(@alignCast(stack), FiberBench.complete, null);
+        try zart.Fiber.init(fiber, @alignCast(stack), FiberBench.complete, null);
     }
     const end = nowNs(reporter.io);
 
@@ -640,7 +640,7 @@ fn measureFiberRun(reporter: Reporter, options: Options, fiber_count: usize) !i9
 
     for (fibers, 0..) |*fiber, index| {
         const stack = stacks[index * options.stack_size ..][0..options.stack_size];
-        fiber.* = try zart.Fiber.init(@alignCast(stack), FiberBench.complete, null);
+        try zart.Fiber.init(fiber, @alignCast(stack), FiberBench.complete, null);
     }
     defer {
         for (fibers) |*fiber| fiber.deinit();
@@ -665,7 +665,8 @@ fn measureFiberYield(reporter: Reporter, options: Options, yield_count: usize) !
     defer std.heap.page_allocator.free(stack);
 
     var remaining = yield_count;
-    var fiber = try zart.Fiber.init(stack, FiberBench.yielding, &remaining);
+    var fiber: zart.Fiber = undefined;
+    try zart.Fiber.init(&fiber, stack, FiberBench.yielding, &remaining);
     defer fiber.deinit();
 
     const start = nowNs(reporter.io);

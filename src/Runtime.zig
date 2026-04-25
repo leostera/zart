@@ -551,7 +551,7 @@ pub const Runtime = struct {
         errdefer rt.actors.cancelReserve(rt.options.scheduler_io, actor_id);
 
         cell.* = Cell.init(rt, actor_id, owner_worker, stack, actor_value);
-        cell.header.fiber = try Fiber.init(stack, Cell.fiberEntry, cell);
+        try Fiber.init(&cell.header.fiber, stack, Cell.fiberEntry, cell);
         errdefer cell.header.fiber.deinit();
 
         rt.actors.publish(&cell.header);
