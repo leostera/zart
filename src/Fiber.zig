@@ -18,7 +18,8 @@
 //! - No reliable unwinding/backtraces across fiber boundaries.
 //! - No CET/shadow-stack integration on x86_64.
 //! - No C++ exception or `longjmp` crossing fiber boundaries.
-//! - No guard-page owning stack helper yet; raw stack overflow corrupts memory.
+//! - Raw caller-provided stack slices have no guard page; use `Stack.alloc`
+//!   when standalone fibers should trap on downward stack overflow.
 //! - No WebAssembly backend yet. Wasm needs an Asyncify/continuation backend,
 //!   not this native stack-pointer/instruction-pointer implementation.
 
@@ -74,6 +75,7 @@ pub const can_resume_on_different_thread_with_external_sync = switch (backend) {
     .wasm_emscripten_asyncify, .unsupported => false,
 };
 pub const supports_migration = can_resume_on_different_thread_with_external_sync;
+pub const supports_guard_page_stack = supported;
 
 pub const Status = enum {
     created,
@@ -89,6 +91,8 @@ pub const InitError = error{
     StackTooSmall,
 };
 
+pub const StackAllocError = InitError || std.posix.MMapError || std.posix.UnexpectedError;
+
 pub const RunError = error{
     Unsupported,
     AlreadyRunning,
@@ -98,6 +102,53 @@ pub const RunError = error{
 };
 
 pub const Entry = *const fn (arg: ?*anyopaque) anyerror!void;
+
+/// Owning POSIX stack allocation with one inaccessible guard page below the
+/// usable stack. This helper is safer than a raw byte slice for standalone
+/// fibers because downward stack overflow traps instead of corrupting adjacent
+/// heap memory.
+pub const Stack = struct {
+    mapping: []align(std.heap.page_size_min) u8,
+    usable: []align(stack_alignment) u8,
+
+    pub fn alloc(usable_size: usize) StackAllocError!Stack {
+        if (comptime !supports_guard_page_stack) return error.Unsupported;
+        if (usable_size < minimum_stack_size) return error.StackTooSmall;
+
+        const page_size = std.heap.pageSize();
+        const usable_bytes = std.mem.alignForward(usize, usable_size, page_size);
+        const map_bytes = std.math.add(usize, page_size, usable_bytes) catch return error.OutOfMemory;
+
+        const posix = std.posix;
+        const mapped = try posix.mmap(
+            null,
+            map_bytes,
+            .{},
+            .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
+            -1,
+            0,
+        );
+        errdefer posix.munmap(mapped);
+
+        const usable_pages: []align(std.heap.page_size_min) u8 = @alignCast(mapped[page_size..]);
+        const protection: posix.PROT = .{ .READ = true, .WRITE = true };
+        switch (posix.errno(posix.system.mprotect(usable_pages.ptr, usable_pages.len, protection))) {
+            .SUCCESS => {},
+            .NOMEM => return error.OutOfMemory,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+
+        return .{
+            .mapping = mapped,
+            .usable = @alignCast(usable_pages[0..usable_size]),
+        };
+    }
+
+    pub fn deinit(stack: *Stack) void {
+        std.posix.munmap(stack.mapping);
+        if (builtin.mode == .Debug) stack.* = undefined;
+    }
+};
 
 const X86FpControl = extern struct {
     mxcsr: u32 = 0x1f80,
@@ -1093,6 +1144,27 @@ test "stack size boundaries are enforced" {
     try testing.expectEqual(@as(usize, 0), fiber.savedStackDepth());
     try testing.expectEqual(Status.completed, try fiber.run());
     try testing.expect(fiber.savedStackDepth() > 0);
+}
+
+test "owning stack provides guarded usable memory" {
+    if (!supports_guard_page_stack) return error.SkipZigTest;
+
+    const testing = std.testing;
+
+    var owned_stack = try Stack.alloc(minimum_stack_size);
+    defer owned_stack.deinit();
+
+    try testing.expect(owned_stack.mapping.len >= owned_stack.usable.len + std.heap.pageSize());
+    try testing.expectEqual(@as(usize, 0), @intFromPtr(owned_stack.mapping.ptr) % std.heap.page_size_min);
+    try testing.expectEqual(@as(usize, 0), @intFromPtr(owned_stack.usable.ptr) % stack_alignment);
+
+    var fiber: Fiber = undefined;
+    try init(&fiber, owned_stack.usable, struct {
+        fn run(_: ?*anyopaque) anyerror!void {}
+    }.run, null);
+    defer fiber.deinit();
+
+    try testing.expectEqual(Status.completed, try fiber.run());
 }
 
 test "fiber records its pinned address" {
